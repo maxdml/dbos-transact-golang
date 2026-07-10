@@ -899,9 +899,11 @@ func (c *client) CreateSchedule(input ClientScheduleInput) error {
 	})
 }
 
-// ApplySchedules atomically creates or replaces the given schedules. Each entry
-// is validated, any existing schedule with the same name is deleted, and the
-// new schedule is inserted — all within a single transaction.
+// ApplySchedules atomically creates or updates the given schedules. Each entry
+// is validated and upserted by schedule_name within a single transaction.
+// On conflict, definition fields are updated while schedule_id, status, and
+// last_fired_at are preserved. The scheduler reconciler restarts cron entries
+// when the definition signature changes.
 //
 // Example:
 //
@@ -948,14 +950,7 @@ func (c *client) ApplySchedules(schedules []ClientScheduleInput) error {
 			queueName = _DBOS_INTERNAL_QUEUE_NAME
 		}
 
-		if err := dbosCtx.systemDB.deleteSchedule(dbosCtx, deleteScheduleDBInput{
-			ScheduleName: req.ScheduleName,
-			tx:           tx,
-		}); err != nil {
-			return fmt.Errorf("failed to delete existing schedule: %w", err)
-		}
-
-		if err := dbosCtx.systemDB.createSchedule(dbosCtx, createScheduleDBInput{
+		if err := dbosCtx.systemDB.upsertSchedule(dbosCtx, upsertScheduleDBInput{
 			ScheduleID:        uuid.New().String(),
 			ScheduleName:      req.ScheduleName,
 			WorkflowName:      req.WorkflowName,
@@ -968,7 +963,7 @@ func (c *client) ApplySchedules(schedules []ClientScheduleInput) error {
 			QueueName:         queueName,
 			tx:                tx,
 		}); err != nil {
-			return fmt.Errorf("failed to create schedule: %w", err)
+			return fmt.Errorf("failed to upsert schedule: %w", err)
 		}
 	}
 

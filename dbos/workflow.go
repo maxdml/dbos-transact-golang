@@ -5440,16 +5440,8 @@ func (c *dbosContext) ApplySchedules(_ DBOSContext, schedules []ApplySchedulesRe
 				queueName = _DBOS_INTERNAL_QUEUE_NAME
 			}
 
-			// Delete any existing schedule with this name, then create the new one.
-			if err := c.systemDB.deleteSchedule(c, deleteScheduleDBInput{
-				ScheduleName: req.ScheduleName,
-				tx:           tx,
-			}); err != nil {
-				return fmt.Errorf("failed to delete existing schedule: %w", err)
-			}
-
 			scheduleID := uuid.New().String()
-			if err := c.systemDB.createSchedule(c, createScheduleDBInput{
+			if err := c.systemDB.upsertSchedule(c, upsertScheduleDBInput{
 				ScheduleID:        scheduleID,
 				ScheduleName:      req.ScheduleName,
 				WorkflowName:      workflowName,
@@ -5461,7 +5453,7 @@ func (c *dbosContext) ApplySchedules(_ DBOSContext, schedules []ApplySchedulesRe
 				QueueName:         queueName,
 				tx:                tx,
 			}); err != nil {
-				return fmt.Errorf("failed to create schedule: %w", err)
+				return fmt.Errorf("failed to upsert schedule: %w", err)
 			}
 		}
 
@@ -5473,7 +5465,9 @@ func (c *dbosContext) ApplySchedules(_ DBOSContext, schedules []ApplySchedulesRe
 }
 
 // ApplySchedules applies a list of schedules, creating new ones or updating existing ones.
-// This is useful for defining a set of static schedules to be created on program start.
+// Existing rows are upserted by schedule_name: definition fields are replaced while
+// schedule_id, status, and last_fired_at are preserved. Useful for defining a set of
+// static schedules to be created on program start.
 //
 // Example:
 //

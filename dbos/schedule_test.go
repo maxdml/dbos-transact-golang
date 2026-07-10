@@ -299,6 +299,12 @@ func TestApplySchedules(t *testing.T) {
 		return err == nil && len(wfs) > 0
 	}, 5*time.Second, 100*time.Millisecond, "toKeep should enqueue on queueA before re-apply")
 
+	// Snapshot schedule_id: re-apply must update definition in place, not replace the row.
+	beforeKeep, err := GetSchedule(dbosCtx, toKeep)
+	require.NoError(t, err)
+	require.NotNil(t, beforeKeep)
+	keepScheduleID := beforeKeep.ScheduleID
+
 	// Round 2: pause one, delete one, re-apply the third to change its queue.
 	require.NoError(t, PauseSchedule(dbosCtx, toPause))
 	require.NoError(t, DeleteSchedule(dbosCtx, toDrop))
@@ -321,11 +327,12 @@ func TestApplySchedules(t *testing.T) {
 	require.Eventually(t, func() bool { return !hasEntry(toDrop) },
 		3*time.Second, 50*time.Millisecond, "reconciler should drop the cron entry for deleted %s", toDrop)
 
-	// Kept: still active, cron entry installed, and queue was updated to queueB.
+	// Kept: still active, same schedule_id, cron entry installed, queue updated to queueB.
 	kept, err := GetSchedule(dbosCtx, toKeep)
 	require.NoError(t, err)
 	require.NotNil(t, kept)
 	require.Equal(t, ScheduleStatusActive, kept.Status)
+	require.Equal(t, keepScheduleID, kept.ScheduleID, "upsert must preserve schedule_id on re-apply")
 	require.Equal(t, queueB.Name, kept.QueueName)
 	require.Eventually(t, func() bool { return hasEntry(toKeep) },
 		3*time.Second, 50*time.Millisecond, "re-applied toKeep should have a cron entry")
@@ -343,6 +350,221 @@ func TestApplySchedules(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, active, 1)
 	require.Equal(t, toKeep, active[0].ScheduleName)
+}
+
+// TestApplySchedulesConcurrent checks that concurrent ApplySchedules of the same
+// name are idempotent (upsert): one row, no error, and re-apply preserves schedule_id.
+func TestApplySchedulesConcurrent(t *testing.T) {
+	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true, schedulerPollingInterval: 100 * time.Millisecond})
+	defer dbosCtx.Shutdown(10 * time.Second)
+
+	RegisterWorkflow(dbosCtx, testWorkflowForSchedule)
+	require.NoError(t, dbosCtx.Launch())
+
+	const (
+		name       = "shared-schedule"
+		numWorkers = 8
+	)
+
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	errs := make(chan error, numWorkers)
+
+	for range numWorkers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			errs <- ApplySchedules(dbosCtx, []ApplySchedulesRequest{
+				{
+					ScheduleName: name,
+					WorkflowFn:   testWorkflowForSchedule,
+					Schedule:     "0 0 * * * *",
+					Context:      map[string]any{"region": "us"},
+				},
+			})
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		require.NoError(t, err)
+	}
+
+	schedules, err := ListSchedules(dbosCtx, WithScheduleNamePrefixes(name))
+	require.NoError(t, err)
+	require.Len(t, schedules, 1)
+	require.Equal(t, name, schedules[0].ScheduleName)
+	require.Equal(t, "0 0 * * * *", schedules[0].Schedule)
+	require.Equal(t, map[string]any{"region": "us"}, schedules[0].Context)
+	scheduleID := schedules[0].ScheduleID
+
+	// Re-applying updates definition in place and preserves schedule_id.
+	require.NoError(t, ApplySchedules(dbosCtx, []ApplySchedulesRequest{
+		{
+			ScheduleName: name,
+			WorkflowFn:   testWorkflowForSchedule,
+			Schedule:     "0 0 0 * * *",
+			Context:      map[string]any{"region": "eu"},
+		},
+	}))
+	schedules, err = ListSchedules(dbosCtx, WithScheduleNamePrefixes(name))
+	require.NoError(t, err)
+	require.Len(t, schedules, 1)
+	require.Equal(t, scheduleID, schedules[0].ScheduleID)
+	require.Equal(t, "0 0 0 * * *", schedules[0].Schedule)
+	require.Equal(t, map[string]any{"region": "eu"}, schedules[0].Context)
+
+	require.NoError(t, DeleteSchedule(dbosCtx, name))
+	schedules, err = ListSchedules(dbosCtx, WithScheduleNamePrefixes(name))
+	require.NoError(t, err)
+	require.Empty(t, schedules)
+}
+
+// TestApplySchedulesLiveUpdate verifies that re-applying a changed definition is
+// picked up by the reconciler (signature change → restart) and new context is used.
+func TestApplySchedulesLiveUpdate(t *testing.T) {
+	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true, schedulerPollingInterval: 100 * time.Millisecond})
+	defer dbosCtx.Shutdown(10 * time.Second)
+
+	resetLiveUpdateContexts()
+	RegisterWorkflow(dbosCtx, testLiveUpdateScheduledWorkflow)
+	require.NoError(t, dbosCtx.Launch())
+
+	const name = "live-update"
+	require.NoError(t, ApplySchedules(dbosCtx, []ApplySchedulesRequest{
+		{
+			ScheduleName: name,
+			WorkflowFn:   testLiveUpdateScheduledWorkflow,
+			Schedule:     "*/1 * * * * *",
+			Context:      map[string]any{"version": 1},
+		},
+	}))
+	t.Cleanup(func() { _ = DeleteSchedule(dbosCtx, name) })
+
+	before, err := GetSchedule(dbosCtx, name)
+	require.NoError(t, err)
+	require.NotNil(t, before)
+
+	require.Eventually(t, func() bool {
+		return liveUpdateContextHasVersion(1)
+	}, 10*time.Second, 100*time.Millisecond, "schedule should fire with context version 1")
+
+	countBefore := liveUpdateContextCount()
+
+	require.NoError(t, ApplySchedules(dbosCtx, []ApplySchedulesRequest{
+		{
+			ScheduleName: name,
+			WorkflowFn:   testLiveUpdateScheduledWorkflow,
+			Schedule:     "*/1 * * * * *",
+			Context:      map[string]any{"version": 2},
+		},
+	}))
+
+	after, err := GetSchedule(dbosCtx, name)
+	require.NoError(t, err)
+	require.NotNil(t, after)
+	require.Equal(t, before.ScheduleID, after.ScheduleID, "live update must preserve schedule_id")
+
+	// Reconciler should restart the entry and fire with the new context.
+	require.Eventually(t, func() bool {
+		return liveUpdateContextVersionCountSince(2, countBefore) >= 2
+	}, 10*time.Second, 100*time.Millisecond, "re-applied schedule should fire with context version 2")
+}
+
+// TestApplySchedulesPreservesRuntimeState checks that re-apply updates definition
+// fields without clobbering status or last_fired_at.
+func TestApplySchedulesPreservesRuntimeState(t *testing.T) {
+	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true, schedulerPollingInterval: 100 * time.Millisecond})
+	defer dbosCtx.Shutdown(10 * time.Second)
+
+	RegisterWorkflow(dbosCtx, testWorkflowForSchedule)
+	// No Launch needed: this test only exercises the DB upsert path.
+	c := dbosCtx.(*dbosContext)
+
+	const name = "state-keep"
+	require.NoError(t, ApplySchedules(dbosCtx, []ApplySchedulesRequest{
+		{
+			ScheduleName: name,
+			WorkflowFn:   testWorkflowForSchedule,
+			Schedule:     "0 0 0 * * *", // rare fire
+			Context:      map[string]any{"version": 1},
+		},
+	}))
+	t.Cleanup(func() { _ = DeleteSchedule(dbosCtx, name) })
+
+	require.NoError(t, PauseSchedule(dbosCtx, name))
+	lastFired := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	require.NoError(t, c.systemDB.updateScheduleLastFiredAt(c, name, lastFired))
+
+	require.NoError(t, ApplySchedules(dbosCtx, []ApplySchedulesRequest{
+		{
+			ScheduleName: name,
+			WorkflowFn:   testWorkflowForSchedule,
+			Schedule:     "0 0 0 * * *",
+			Context:      map[string]any{"version": 2},
+		},
+	}))
+
+	sched, err := GetSchedule(dbosCtx, name)
+	require.NoError(t, err)
+	require.NotNil(t, sched)
+	require.Equal(t, ScheduleStatusPaused, sched.Status, "status must be preserved")
+	require.NotNil(t, sched.LastFiredAt)
+	require.True(t, sched.LastFiredAt.Equal(lastFired), "last_fired_at must be preserved, got %v", sched.LastFiredAt)
+	require.Equal(t, map[string]any{"version": float64(2)}, sched.Context, "definition context must still update")
+}
+
+// TestCalculateScheduleSignature ensures definition fields affect the signature
+// and identity/lifecycle/runtime fields do not.
+func TestCalculateScheduleSignature(t *testing.T) {
+	c := &dbosContext{}
+	base := WorkflowSchedule{
+		ScheduleID:        "id-1",
+		ScheduleName:      "sig",
+		WorkflowName:      "wf",
+		WorkflowClassName: "",
+		Schedule:          "* * * * *",
+		Status:            ScheduleStatusActive,
+		Context:           "ctx",
+		LastFiredAt:       nil,
+		AutomaticBackfill: false,
+		CronTimezone:      "",
+		QueueName:         "",
+	}
+	sig, err := c.calculateSignature(base)
+	require.NoError(t, err)
+
+	// Identity / lifecycle / runtime fields must NOT change the signature.
+	lastFired := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
+	unchanged := []WorkflowSchedule{
+		{ScheduleID: "id-2", ScheduleName: base.ScheduleName, WorkflowName: base.WorkflowName, Schedule: base.Schedule, Status: base.Status, Context: base.Context},
+		{ScheduleID: base.ScheduleID, ScheduleName: "other-name", WorkflowName: base.WorkflowName, Schedule: base.Schedule, Status: base.Status, Context: base.Context},
+		{ScheduleID: base.ScheduleID, ScheduleName: base.ScheduleName, WorkflowName: base.WorkflowName, Schedule: base.Schedule, Status: ScheduleStatusPaused, Context: base.Context},
+		{ScheduleID: base.ScheduleID, ScheduleName: base.ScheduleName, WorkflowName: base.WorkflowName, Schedule: base.Schedule, Status: base.Status, Context: base.Context, LastFiredAt: &lastFired},
+		{ScheduleID: base.ScheduleID, ScheduleName: base.ScheduleName, WorkflowName: base.WorkflowName, Schedule: base.Schedule, Status: base.Status, Context: base.Context, AutomaticBackfill: true},
+	}
+	for i, s := range unchanged {
+		got, err := c.calculateSignature(s)
+		require.NoError(t, err)
+		require.Equal(t, sig, got, "case %d should not change signature", i)
+	}
+
+	// Definition fields MUST change the signature.
+	changed := []WorkflowSchedule{
+		{WorkflowName: "wf2", Schedule: base.Schedule, Context: base.Context},
+		{WorkflowName: base.WorkflowName, WorkflowClassName: "SomeClass", Schedule: base.Schedule, Context: base.Context},
+		{WorkflowName: base.WorkflowName, Schedule: "0 * * * *", Context: base.Context},
+		{WorkflowName: base.WorkflowName, Schedule: base.Schedule, Context: "ctx2"},
+		{WorkflowName: base.WorkflowName, Schedule: base.Schedule, Context: base.Context, CronTimezone: "America/Los_Angeles"},
+		{WorkflowName: base.WorkflowName, Schedule: base.Schedule, Context: base.Context, QueueName: "q"},
+	}
+	for i, s := range changed {
+		got, err := c.calculateSignature(s)
+		require.NoError(t, err)
+		require.NotEqual(t, sig, got, "case %d should change signature", i)
+	}
 }
 
 func TestApplySchedulesInvalidSignature(t *testing.T) {
@@ -650,6 +872,74 @@ func testWorkflowForScheduleCustomName(ctx DBOSContext, input ScheduledWorkflowI
 }
 
 var scheduledInputCapture sync.Map
+
+// liveUpdateContextCapture holds contexts seen by testLiveUpdateScheduledWorkflow.
+var (
+	liveUpdateContextsMu sync.Mutex
+	liveUpdateContexts   []any
+)
+
+func resetLiveUpdateContexts() {
+	liveUpdateContextsMu.Lock()
+	liveUpdateContexts = nil
+	liveUpdateContextsMu.Unlock()
+}
+
+func appendLiveUpdateContext(ctx any) {
+	liveUpdateContextsMu.Lock()
+	liveUpdateContexts = append(liveUpdateContexts, ctx)
+	liveUpdateContextsMu.Unlock()
+}
+
+func snapshotLiveUpdateContexts() []any {
+	liveUpdateContextsMu.Lock()
+	defer liveUpdateContextsMu.Unlock()
+	out := make([]any, len(liveUpdateContexts))
+	copy(out, liveUpdateContexts)
+	return out
+}
+
+func liveUpdateContextCount() int {
+	liveUpdateContextsMu.Lock()
+	defer liveUpdateContextsMu.Unlock()
+	return len(liveUpdateContexts)
+}
+
+func liveUpdateContextHasVersion(version float64) bool {
+	for _, c := range snapshotLiveUpdateContexts() {
+		m, ok := c.(map[string]any)
+		if !ok {
+			continue
+		}
+		if v, ok := m["version"].(float64); ok && v == version {
+			return true
+		}
+	}
+	return false
+}
+
+func liveUpdateContextVersionCountSince(version float64, since int) int {
+	xs := snapshotLiveUpdateContexts()
+	if since > len(xs) {
+		since = len(xs)
+	}
+	n := 0
+	for _, c := range xs[since:] {
+		m, ok := c.(map[string]any)
+		if !ok {
+			continue
+		}
+		if v, ok := m["version"].(float64); ok && v == version {
+			n++
+		}
+	}
+	return n
+}
+
+func testLiveUpdateScheduledWorkflow(ctx DBOSContext, input ScheduledWorkflowInput) (any, error) {
+	appendLiveUpdateContext(input.Context)
+	return "completed", nil
+}
 
 func testCapturingScheduledWorkflow(ctx DBOSContext, input ScheduledWorkflowInput) (any, error) {
 	wfID, _ := GetWorkflowID(ctx)

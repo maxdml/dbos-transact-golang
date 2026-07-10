@@ -102,6 +102,7 @@ type systemDatabase interface {
 	getMetrics(ctx context.Context, startTime string, endTime string) ([]metricData, error)
 
 	// Schedules
+	upsertSchedule(ctx context.Context, input upsertScheduleDBInput) error
 	createSchedule(ctx context.Context, input createScheduleDBInput) error
 	listSchedules(ctx context.Context, input listSchedulesDBInput) ([]WorkflowSchedule, error)
 	updateSchedule(ctx context.Context, input updateScheduleDBInput) error
@@ -4758,6 +4759,71 @@ func (s *sysDB) getMetricStepCount(ctx context.Context, startEpochMs, endEpochMs
 /*******************************/
 /******* SCHEDULES ********/
 /*******************************/
+
+type upsertScheduleDBInput struct {
+	ScheduleID        string
+	ScheduleName      string
+	WorkflowName      string
+	WorkflowClassName string
+	Schedule          string
+	Context           string // JSON serialized
+	Status            ScheduleStatus
+	AutomaticBackfill bool
+	CronTimezone      string
+	QueueName         string
+	tx                Tx // optional: run inside an existing transaction
+}
+
+func (s *sysDB) upsertSchedule(ctx context.Context, input upsertScheduleDBInput) error {
+	query := s.renderSQL(`
+		INSERT INTO %sworkflow_schedules (
+			schedule_id, schedule_name, workflow_name, workflow_class_name,
+			schedule, context, status, automatic_backfill, cron_timezone, queue_name
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+		ON CONFLICT (schedule_name) DO UPDATE SET
+			workflow_name = EXCLUDED.workflow_name,
+			workflow_class_name = EXCLUDED.workflow_class_name,
+			schedule = EXCLUDED.schedule,
+			context = EXCLUDED.context,
+			cron_timezone = EXCLUDED.cron_timezone,
+			queue_name = EXCLUDED.queue_name,
+			automatic_backfill = EXCLUDED.automatic_backfill
+	`, s.dialect.SchemaPrefix(s.schema))
+
+	var queueNameVal any
+	if input.QueueName != "" {
+		queueNameVal = input.QueueName
+	}
+
+	var workflowClassNameVal any
+	if input.WorkflowClassName != "" {
+		workflowClassNameVal = input.WorkflowClassName
+	}
+
+	args := []any{
+		input.ScheduleID,
+		input.ScheduleName,
+		input.WorkflowName,
+		workflowClassNameVal,
+		input.Schedule,
+		input.Context,
+		input.Status,
+		input.AutomaticBackfill,
+		input.CronTimezone,
+		queueNameVal,
+	}
+
+	var err error
+	if input.tx != nil {
+		_, err = input.tx.Exec(ctx, query, args...)
+	} else {
+		_, err = s.pool.Exec(ctx, query, args...)
+	}
+	if err != nil {
+		return fmt.Errorf("failed to upsert schedule: %w", err)
+	}
+	return nil
+}
 
 type createScheduleDBInput struct {
 	ScheduleID        string

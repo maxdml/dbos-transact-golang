@@ -1,6 +1,9 @@
 package dbos
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"math/rand/v2"
 	"sync/atomic"
@@ -227,6 +230,12 @@ func (c *dbosContext) buildDBScheduleFunc(schedule WorkflowSchedule) ScheduledWo
 }
 
 func (c *dbosContext) addDBScheduleToScheduler(schedule WorkflowSchedule) {
+	sig, err := c.calculateSignature(schedule)
+	if err != nil {
+		c.logger.Error("failed to calculate signature", "error", err)
+		return
+	}
+
 	fn := c.buildDBScheduleFunc(schedule)
 
 	spec := schedule.Schedule
@@ -242,7 +251,7 @@ func (c *dbosContext) addDBScheduleToScheduler(schedule WorkflowSchedule) {
 
 	c.scheduleMu.Lock()
 	c.scheduleEntryIDs[schedule.ScheduleName] = entryID
-	c.scheduleInstalledIDs[schedule.ScheduleName] = schedule.ScheduleID
+	c.scheduleInstalledSignatures[schedule.ScheduleName] = sig
 	c.scheduleMu.Unlock()
 	c.logger.Info("Added schedule to scheduler", "schedule", schedule.ScheduleName, "workflow", schedule.WorkflowName)
 }
@@ -259,7 +268,7 @@ func (c *dbosContext) removeDBScheduleFromScheduler(scheduleName string) {
 	entryID, exists := c.scheduleEntryIDs[scheduleName]
 	if exists {
 		delete(c.scheduleEntryIDs, scheduleName)
-		delete(c.scheduleInstalledIDs, scheduleName)
+		delete(c.scheduleInstalledSignatures, scheduleName)
 	}
 	c.scheduleMu.Unlock()
 	if !exists {
@@ -291,6 +300,52 @@ func (c *dbosContext) runScheduleReconciler() {
 	}
 }
 
+// calculateSignature hashes definition fields only (not identity/lifecycle/runtime state).
+func (c *dbosContext) calculateSignature(s WorkflowSchedule) ([]byte, error) {
+	sig := struct {
+		WorkflowName      string `json:"workflow_name"`
+		WorkflowClassName string `json:"workflow_class_name"`
+		Schedule          string `json:"schedule"`
+		Context           any    `json:"context"`
+		CronTimezone      string `json:"cron_timezone"`
+		QueueName         string `json:"queue_name"`
+	}{
+		s.WorkflowName,
+		s.WorkflowClassName,
+		s.Schedule,
+		s.Context,
+		s.CronTimezone,
+		s.QueueName,
+	}
+
+	buf, err := json.Marshal(&sig)
+	if err != nil {
+		return nil, err
+	}
+	sum := sha256.Sum256(buf)
+	return sum[:], nil
+}
+
+func (c *dbosContext) maybeAutomaticBackfill(sched *WorkflowSchedule) {
+	if !sched.AutomaticBackfill || sched.LastFiredAt == nil {
+		return
+	}
+	start := sched.LastFiredAt.Add(time.Second)
+	end := time.Now()
+	if !start.Before(end) {
+		return
+	}
+	c.logger.Info("performing automatic backfill", "schedule", sched.ScheduleName, "start", start, "end", end)
+	if _, err := c.systemDB.backfillSchedule(c, backfillScheduleDBInput{
+		ScheduleName: sched.ScheduleName,
+		Schedule:     sched.Schedule,
+		StartTime:    start,
+		EndTime:      end,
+	}); err != nil {
+		c.logger.Error("automatic backfill failed", "schedule", sched.ScheduleName, "error", err)
+	}
+}
+
 func (c *dbosContext) reconcileSchedules() {
 	schedules, err := c.systemDB.listSchedules(c, listSchedulesDBInput{})
 	if err != nil {
@@ -303,18 +358,13 @@ func (c *dbosContext) reconcileSchedules() {
 		current[schedules[i].ScheduleName] = &schedules[i]
 	}
 
-	// Remove entries that were deleted, paused, or replaced (re-applied with a
-	// new ScheduleID — e.g. a changed cron spec, queue, context, or timezone).
-	// Collect names first to avoid mutating the map while iterating.
+	// Remove entries that were deleted or paused. Collect names first to avoid
+	// mutating the map while iterating.
 	var toRemove []string
 	c.scheduleMu.Lock()
 	for name := range c.scheduleEntryIDs {
 		sched, ok := current[name]
 		if !ok || sched.Status != ScheduleStatusActive {
-			toRemove = append(toRemove, name)
-			continue
-		}
-		if c.scheduleInstalledIDs[name] != sched.ScheduleID {
 			toRemove = append(toRemove, name)
 		}
 	}
@@ -323,34 +373,34 @@ func (c *dbosContext) reconcileSchedules() {
 		c.removeDBScheduleFromScheduler(name)
 	}
 
-	// Add new active schedules.
+	// Start, restart, or leave running based on definition signature.
 	for name, sched := range current {
 		if sched.Status != ScheduleStatusActive {
 			continue
 		}
+
 		c.scheduleMu.Lock()
 		_, exists := c.scheduleEntryIDs[name]
+		installedSig := c.scheduleInstalledSignatures[name]
 		c.scheduleMu.Unlock()
+
 		if exists {
+			// Running — restart on a changed definition; no backfill needed.
+			sig, err := c.calculateSignature(*sched)
+			if err != nil {
+				c.logger.Error("failed to calculate signature", "schedule", name, "error", err)
+				continue
+			}
+			if bytes.Equal(installedSig, sig) {
+				continue
+			}
+			c.removeDBScheduleFromScheduler(name)
+			c.addDBScheduleToScheduler(*sched)
 			continue
 		}
 
-		if sched.AutomaticBackfill && sched.LastFiredAt != nil {
-			start := sched.LastFiredAt.Add(time.Second)
-			end := time.Now()
-			if start.Before(end) {
-				c.logger.Info("performing automatic backfill", "schedule", sched.ScheduleName, "start", start, "end", end)
-				if _, err := c.systemDB.backfillSchedule(c, backfillScheduleDBInput{
-					ScheduleName: sched.ScheduleName,
-					Schedule:     sched.Schedule,
-					StartTime:    start,
-					EndTime:      end,
-				}); err != nil {
-					c.logger.Error("automatic backfill failed", "schedule", sched.ScheduleName, "error", err)
-				}
-			}
-		}
-
+		// Not running — start it, backfilling missed executions first if enabled.
+		c.maybeAutomaticBackfill(sched)
 		c.addDBScheduleToScheduler(*sched)
 	}
 }

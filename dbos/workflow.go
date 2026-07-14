@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -76,10 +77,10 @@ type workflowState struct {
 	isWithinStep        bool
 	isWithinTransaction bool
 	isPortableWorkflow  bool
-	// auth identity carried so child workflows can inherit it automatically
-	authenticatedUser  string
-	assumedRole        string
-	authenticatedRoles []string
+	authenticatedUser   string
+	assumedRole         string
+	authenticatedRoles  []string
+	workflowCtx         context.Context
 }
 
 // nextStepID returns the next step ID and increments the counter
@@ -98,6 +99,9 @@ type workflowOutcome[R any] struct {
 	err           error
 	needsDecoding bool   // true if result came from awaitWorkflowResult (ID conflict path) and needs decoding
 	serialization string // serialization format of the encoded result (only used when needsDecoding is true)
+	// cancelled reports that the workflow settled in CANCELLED. An awaiting parent
+	// records it as an AwaitedWorkflowCancelled outcome for its getResult step.
+	cancelled bool
 }
 
 type stepCheckpointedOutcome struct {
@@ -244,15 +248,18 @@ func checkGetResultExecution[R any](dbosCtx context.Context) (R, bool, error) {
 	}
 	if recordedOutputs != nil {
 		workflowState.nextStepID()
-		decoder, err := resolveDecoder[R](recordedOutputs.serialization, dbosCtx.(*dbosContext).serializer)
-		if err != nil {
-			return *new(R), false, fmt.Errorf("failed to resolve decoder: %w", err)
+		var decodedOutput R
+		if recordedOutputs.output != nil {
+			decoder, err := resolveDecoder[R](recordedOutputs.serialization, dbosCtx.(*dbosContext).serializer)
+			if err != nil {
+				return *new(R), false, fmt.Errorf("failed to resolve decoder: %w", err)
+			}
+			decodedOutput, err = decoder.Decode(recordedOutputs.output)
+			if err != nil {
+				return *new(R), false, fmt.Errorf("failed to decode operation result: %w", err)
+			}
 		}
-		decodedOutput, err := decoder.Decode(recordedOutputs.output)
-		if err != nil {
-			return *new(R), false, fmt.Errorf("failed to decode operation result: %w", err)
-		}
-		return decodedOutput, true, nil
+		return decodedOutput, true, deserializeWorkflowError(recordedOutputs.errStr)
 	}
 	return *new(R), false, nil
 }
@@ -270,13 +277,12 @@ func (h *workflowHandle[R]) GetResult(opts ...GetResultOption) (R, error) {
 
 	// If within a workflow, check if we already ran that step
 	result, found, err := checkGetResultExecution[R](h.dbosContext)
-	if err != nil {
+	if found {
+		return result, err
+	}
+	if err != nil { // not found and err means err is an infrastructure error
 		return *new(R), err
 	}
-	if found {
-		return result, nil
-	}
-
 	startTime := time.Now()
 
 	var timeoutChan <-chan time.Time
@@ -309,6 +315,19 @@ func (h *workflowHandle[R]) processOutcome(outcome workflowOutcome[R], startTime
 		if _, ok := h.dbosContext.(*dbosContext); !ok {
 			return *new(R), newWorkflowExecutionError(workflowState.workflowID, fmt.Errorf("invalid DBOSContext: expected *dbosContext"))
 		}
+		// A cancellation outcome delivered while the awaiting workflow is itself
+		// cancelled interrupts the getResult step: don't checkpoint it, so resume
+		// re-executes the await.
+		if stepInterruptedByCancellation(workflowState, outcome.err) {
+			return *new(R), newWorkflowCancelledError(workflowState.workflowID, outcome.err)
+		}
+		// A cancelled child is a terminal outcome for the awaiting parent: checkpoint
+		// it like any other child error so replay is deterministic.
+		// Resuming the child later does not change what the parent saw.
+		if outcome.cancelled {
+			decodedResult = *new(R)
+			outcome.err = newAwaitedWorkflowCancelledError(h.workflowID)
+		}
 		ser := resolveEncoder(h.dbosContext)
 		encodedOutput, encErr := ser.Encode(decodedResult)
 		if encErr != nil {
@@ -338,6 +357,11 @@ func (h *workflowHandle[R]) processOutcome(outcome workflowOutcome[R], startTime
 			h.dbosContext.(*dbosContext).logger.Error("failed to record get result", "error", recordResultErr)
 			return *new(R), newWorkflowExecutionError(workflowState.workflowID, fmt.Errorf("recording child workflow result: %w", recordResultErr))
 		}
+	} else if outcome.cancelled && !isCancellationError(outcome.err) {
+		// The workflow swallowed its cancellation (returned normally or with an
+		// unrelated error) but we triggered durable cancel and no output was
+		// recorded: report cancellation, not success.
+		return *new(R), newWorkflowCancelledError(h.workflowID, outcome.err)
 	}
 	return decodedResult, outcome.err
 }
@@ -354,13 +378,12 @@ func (h *workflowPollingHandle[R]) GetResult(opts ...GetResultOption) (R, error)
 
 	// If within a workflow, check if we already ran that step
 	result, found, err := checkGetResultExecution[R](h.dbosContext)
+	if found {
+		return result, err
+	}
 	if err != nil {
 		return *new(R), err
 	}
-	if found {
-		return result, nil
-	}
-
 	startTime := time.Now()
 
 	// Use timeout if specified, otherwise use DBOS context directly
@@ -383,6 +406,20 @@ func (h *workflowPollingHandle[R]) GetResult(opts ...GetResultOption) (R, error)
 		err = deserializeWorkflowError(awaitResult.errStr)
 	}
 
+	workflowState, ok := h.dbosContext.Value(workflowStateKey).(*workflowState)
+	isWithinWorkflow := ok && workflowState != nil
+	// A cancellation outcome delivered while the awaiting workflow is itself
+	// cancelled interrupts the getResult step: don't checkpoint it, so resume
+	// re-executes the await.
+	if isWithinWorkflow && stepInterruptedByCancellation(workflowState, err) {
+		return *new(R), newWorkflowCancelledError(workflowState.workflowID, err)
+	}
+
+	// A cancelled child is a terminal outcome for the awaiting parent: checkpoint
+	// it like any other child error so replay is deterministic.
+	// Resuming the child later does not change what the parent saw.
+	childCancelled := errors.Is(awaitErr, &DBOSError{Code: AwaitedWorkflowCancelled})
+
 	// Deserialize the result directly into the target type
 	var typedResult R
 	var encodedStr *string
@@ -401,34 +438,40 @@ func (h *workflowPollingHandle[R]) GetResult(opts ...GetResultOption) (R, error)
 		if deserErr != nil {
 			return *new(R), fmt.Errorf("failed to deserialize workflow result: %w", deserErr)
 		}
-
-		// If we are calling GetResult inside a workflow, record the result as a step result
-		workflowState, ok := h.dbosContext.Value(workflowStateKey).(*workflowState)
-		isWithinWorkflow := ok && workflowState != nil
-		if isWithinWorkflow {
-			recordGetResultInput := recordOperationResultDBInput{
-				workflowID:      workflowState.workflowID,
-				childWorkflowID: h.workflowID,
-				stepID:          workflowState.nextStepID(),
-				output:          encodedStr,
-				errStr:          awaitResult.errStr,
-				startedAt:       startTime,
-				completedAt:     completedTime,
-				stepName:        "DBOS.getResult",
-				serialization:   storedSerialization,
-			}
-			uncancellableCtx := context.WithoutCancel(h.dbosContext)
-			recordResultErr := retry(h.dbosContext, func() error {
-				return h.dbosContext.(*dbosContext).systemDB.recordOperationResult(uncancellableCtx, recordGetResultInput)
-			}, withRetrierLogger(h.dbosContext.(*dbosContext).logger))
-			if recordResultErr != nil {
-				h.dbosContext.(*dbosContext).logger.Error("failed to record get result", "error", recordResultErr)
-				return *new(R), newWorkflowExecutionError(workflowState.workflowID, fmt.Errorf("recording child workflow result: %w", recordResultErr))
-			}
-		}
-		return typedResult, err
 	}
-	return *new(R), err
+
+	// If we are calling GetResult inside a workflow, record the outcome as a step
+	// result: either the workflow result proper (no dlq, no raw awaitWorkflowResult
+	// error) or the child's cancellation.
+	if isWithinWorkflow && (childCancelled || (awaitErr == nil && encodedStr != nil)) {
+		errStr := awaitResult.errStr
+		serialization := storedSerialization
+		if childCancelled {
+			serialization = resolveEncoder(h.dbosContext).Name()
+			serializedErr := serializeWorkflowError(awaitErr, serialization)
+			errStr = &serializedErr
+		}
+		recordGetResultInput := recordOperationResultDBInput{
+			workflowID:      workflowState.workflowID,
+			childWorkflowID: h.workflowID,
+			stepID:          workflowState.nextStepID(),
+			output:          encodedStr,
+			errStr:          errStr,
+			startedAt:       startTime,
+			completedAt:     completedTime,
+			stepName:        "DBOS.getResult",
+			serialization:   serialization,
+		}
+		uncancellableCtx := context.WithoutCancel(h.dbosContext)
+		recordResultErr := retry(h.dbosContext, func() error {
+			return h.dbosContext.(*dbosContext).systemDB.recordOperationResult(uncancellableCtx, recordGetResultInput)
+		}, withRetrierLogger(h.dbosContext.(*dbosContext).logger))
+		if recordResultErr != nil {
+			h.dbosContext.(*dbosContext).logger.Error("failed to record get result", "error", recordResultErr)
+			return *new(R), newWorkflowExecutionError(workflowState.workflowID, fmt.Errorf("recording child workflow result: %w", recordResultErr))
+		}
+	}
+	return typedResult, err
 }
 
 // Wrapper handle -- useful for handling mocks in RunWorkflow
@@ -1106,8 +1149,9 @@ func RunWorkflow[P any, R any](ctx DBOSContext, fn Workflow[P, R], input P, opts
 			// Handle nil results - nil cannot be type-asserted to any interface
 			if outcome.result == nil {
 				typedOutcomeChan <- workflowOutcome[R]{
-					result: typedResult,
-					err:    resultErr,
+					result:    typedResult,
+					err:       resultErr,
+					cancelled: outcome.cancelled,
 				}
 				return
 			}
@@ -1115,8 +1159,9 @@ func RunWorkflow[P any, R any](ctx DBOSContext, fn Workflow[P, R], input P, opts
 			// Check if this is a mocked path
 			if _, ok := handle.dbosContext.(*dbosContext); !ok {
 				typedOutcomeChan <- workflowOutcome[R]{
-					result: outcome.result.(R),
-					err:    resultErr,
+					result:    outcome.result.(R),
+					err:       resultErr,
+					cancelled: outcome.cancelled,
 				}
 				return
 			}
@@ -1148,8 +1193,9 @@ func RunWorkflow[P any, R any](ctx DBOSContext, fn Workflow[P, R], input P, opts
 			}
 
 			typedOutcomeChan <- workflowOutcome[R]{
-				result: typedResult,
-				err:    resultErr,
+				result:    typedResult,
+				err:       resultErr,
+				cancelled: outcome.cancelled,
 			}
 		}()
 
@@ -1534,24 +1580,25 @@ func (c *dbosContext) RunWorkflow(_ DBOSContext, fn WorkflowFunc, input any, opt
 		durableDeadline = insertStatusResult.workflowDeadline
 	}
 
-	var stopFunc func() bool
-	cancelFuncCompleted := make(chan struct{})
 	if !durableDeadline.IsZero() {
 		workflowCtx, _ = WithTimeout(workflowCtx, time.Until(durableDeadline))
-		// Register a cancel function that cancels the workflow in the DB as soon as the context is cancelled
-		workflowCancelFunction := func() {
-			c.logger.Info("Cancelling workflow", "workflow_id", workflowID)
-			err := retry(c, func() error {
-				_, err := c.systemDB.cancelWorkflows(uncancellableCtx, cancelWorkflowsDBInput{workflowIDs: []string{workflowID}})
-				return err
-			}, withRetrierLogger(c.logger))
-			if err != nil {
-				c.logger.Error("Failed to cancel workflow", "error", err)
-			}
-			close(cancelFuncCompleted)
-		}
-		stopFunc = context.AfterFunc(workflowCtx, workflowCancelFunction)
 	}
+	// Register a cancel function that durably cancels the workflow in the DB as soon as
+	// the context is cancelled (durable deadline, user cancel, or parent cancellation).
+	cancelFuncCompleted := make(chan struct{})
+	workflowCancelFunction := func() {
+		c.logger.Info("Cancelling workflow", "workflow_id", workflowID)
+		err := retry(c, func() error {
+			_, err := c.systemDB.cancelWorkflows(uncancellableCtx, cancelWorkflowsDBInput{workflowIDs: []string{workflowID}})
+			return err
+		}, withRetrierLogger(c.logger))
+		if err != nil {
+			c.logger.Error("Failed to cancel workflow", "error", err)
+		}
+		close(cancelFuncCompleted)
+	}
+	stopFunc := context.AfterFunc(workflowCtx, workflowCancelFunction)
+	wfState.workflowCtx = workflowCtx
 
 	// Run the function in a goroutine
 	outcomeChan := make(chan workflowOutcome[any], 1)
@@ -1559,6 +1606,7 @@ func (c *dbosContext) RunWorkflow(_ DBOSContext, fn WorkflowFunc, input any, opt
 	go func() {
 		defer c.workflowsWg.Done()
 
+		removeActive := func() {}
 		if c.activeWorkflowIDs != nil {
 			entry := activeWorkflowEntry{}
 			if insertStatusResult.queueName != nil {
@@ -1571,8 +1619,10 @@ func (c *dbosContext) RunWorkflow(_ DBOSContext, fn WorkflowFunc, input any, opt
 			if loaded { // This should never happen, but if it does, we need to log it
 				c.logger.Error("UNREACHABLE: workflow already running on this context", "workflow_id", workflowID)
 			}
-			defer c.activeWorkflowIDs.Delete(workflowID)
+			var removeOnce sync.Once
+			removeActive = func() { removeOnce.Do(func() { c.activeWorkflowIDs.Delete(workflowID) }) }
 		}
+		defer removeActive()
 
 		var result any
 		var err error
@@ -1581,6 +1631,9 @@ func (c *dbosContext) RunWorkflow(_ DBOSContext, fn WorkflowFunc, input any, opt
 
 		// Handle DBOS ID conflict errors by waiting workflow result
 		if errors.Is(err, &DBOSError{Code: ConflictingIDError}) {
+			// This run lost the ID conflict: it does not own the workflow, so its
+			// context must no longer durably cancel it. Disarm the cancel function.
+			stopFunc()
 			c.logger.Warn("Workflow ID conflict detected. Waiting for existing workflow to complete", "workflow_id", workflowID)
 			awaitOut, awaitErr := retryWithResult(c, func() (*awaitWorkflowResultOutput, error) {
 				return c.systemDB.awaitWorkflowResult(uncancellableCtx, workflowID, _DB_RETRY_INTERVAL)
@@ -1596,30 +1649,43 @@ func (c *dbosContext) RunWorkflow(_ DBOSContext, fn WorkflowFunc, input any, opt
 				ser = awaitOut.serialization
 			}
 			// Keep the encoded result - decoding will happen in RunWorkflow[P,R] when we know the target type
-			outcomeChan <- workflowOutcome[any]{result: encodedResult, err: err, needsDecoding: true, serialization: ser}
+			outcomeChan <- workflowOutcome[any]{result: encodedResult, err: err, needsDecoding: true, serialization: ser,
+				cancelled: errors.Is(err, &DBOSError{Code: AwaitedWorkflowCancelled})}
 			close(outcomeChan)
 			return
 		} else {
-			status := WorkflowStatusSuccess
-
-			// If an error occurred, set the status to error
-			if err != nil {
-				status = WorkflowStatusError
+			// A cancelled run skips updateWorkflowOutcome entirely so it can never
+			// clobber the row (e.g., ENQUEUED written by a concurrent resume).
+			if !stopFunc() {
+				// AfterFunc fired => context is cancelled. Wait for the DB cancel to finish.
+				c.logger.Info("Workflow was cancelled. Waiting for cancel function to complete", "workflow_id", workflowID)
+				<-cancelFuncCompleted
+				removeActive()
+				outcomeChan <- workflowOutcome[any]{result: result, err: err, cancelled: true}
+				close(outcomeChan)
+				return
+			}
+			if workflowCtx.Err() != nil && isCancellationError(err) {
+				// We stopped the AfterFunc but the context was already cancelled
+				// so we need to run the durable cancel ourselves.
+				workflowCancelFunction()
+				removeActive()
+				outcomeChan <- workflowOutcome[any]{result: result, err: err, cancelled: true}
+				close(outcomeChan)
+				return
+			}
+			if errors.Is(err, &DBOSError{Code: WorkflowCancelled}) {
+				// The workflow observed its own cancellation in the DB (external
+				// cancel): the row is already CANCELLED. Skip the outcome write.
+				removeActive()
+				outcomeChan <- workflowOutcome[any]{result: result, err: err, cancelled: true}
+				close(outcomeChan)
+				return
 			}
 
-			// If the afterFunc has started, the workflow was cancelled and the status should be set to cancelled
-			// Also handle the race between the AfterFunc firing and the workflow returning with a context cancellation.
-			if stopFunc != nil {
-				if !stopFunc() {
-					// AfterFunc fired => context is cancelled. Wait for the DB cancel to finish.
-					c.logger.Info("Workflow was cancelled. Waiting for cancel function to complete", "workflow_id", workflowID)
-					<-cancelFuncCompleted
-					status = WorkflowStatusCancelled
-				} else if workflowCtx.Err() != nil {
-					// We stopped the AfterFunc, but lost the race: the context was already
-					// cancelled by the time the workflow returned.
-					status = WorkflowStatusCancelled
-				}
+			status := WorkflowStatusSuccess
+			if err != nil {
+				status = WorkflowStatusError
 			}
 
 			// Serialize the output before recording
@@ -1635,6 +1701,10 @@ func (c *dbosContext) RunWorkflow(_ DBOSContext, fn WorkflowFunc, input any, opt
 			if err != nil {
 				serializedErr = serializeWorkflowError(err, resolveEncoder(workflowCtx).Name())
 			}
+			// Remove from the active set before the outcome becomes durable: once it is
+			// visible, a resume→dequeue can re-dispatch this workflow to this executor,
+			// marking it PENDING. But a stale activeID entry would prevent the workflow from running.
+			removeActive()
 			recordErr := retry(c, func() error {
 				return c.systemDB.updateWorkflowOutcome(uncancellableCtx, updateWorkflowOutcomeDBInput{
 					workflowID: workflowID,
@@ -1644,6 +1714,16 @@ func (c *dbosContext) RunWorkflow(_ DBOSContext, fn WorkflowFunc, input any, opt
 				})
 			}, withRetrierLogger(c.logger))
 			if recordErr != nil {
+				// The write was refused because the row is already terminal or has been
+				// superseded (cancelled during the final step, or re-enqueued by a
+				// concurrent resume): end as cancelled, not complete. Deliver a
+				// cancellation outcome wrapping the workflow's own error so
+				// context.Canceled/DeadlineExceeded still match via errors.Is.
+				if errors.Is(recordErr, &DBOSError{Code: WorkflowCancelled}) {
+					outcomeChan <- workflowOutcome[any]{result: result, err: newWorkflowCancelledError(workflowID, err), cancelled: true}
+					close(outcomeChan)
+					return
+				}
 				c.logger.Error("Error recording workflow outcome", "workflow_id", workflowID, "error", recordErr)
 				outcomeChan <- workflowOutcome[any]{result: nil, err: recordErr}
 				close(outcomeChan)
@@ -1874,6 +1954,7 @@ func prepareStepExecution(c *dbosContext, opts []StepOption) (*preparedStep, err
 		workflowID:   wfState.workflowID,
 		stepID:       stepID,
 		isWithinStep: true,
+		workflowCtx:  wfState.workflowCtx,
 	}
 	return &preparedStep{WorkflowID: wfState.workflowID, StepOpts: stepOpts, StepState: &stepState, IsWithinStep: false}, nil
 }
@@ -1933,6 +2014,18 @@ func executeStepWithRetry(c *dbosContext, workflowID string, stepOpts *stepOptio
 	return stepOutput, stepError
 }
 
+func isCancellationError(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, &DBOSError{Code: WorkflowCancelled}) || errors.Is(err, &DBOSError{Code: AwaitedWorkflowCancelled})
+}
+
+func stepInterruptedByCancellation(stepState *workflowState, stepError error) bool {
+	if stepState.workflowCtx == nil || stepState.workflowCtx.Err() == nil {
+		return false
+	}
+	return isCancellationError(stepError)
+}
+
 // RunAsStep executes a function as a durable step within a workflow.
 // Steps provide at-least-once execution guarantees and automatic retry capabilities.
 // If a step has already been executed (e.g., during workflow recovery), its recorded
@@ -1976,6 +2069,14 @@ func executeStepWithRetry(c *dbosContext, workflowID string, stepOpts *stepOptio
 // Note that the function passed to RunAsStep must accept a context.Context as its first parameter
 // and this context *must* be the one specified in the function's signature (not the context passed to RunAsStep).
 // Under the hood, DBOS uses the provided context to manage durable execution.
+//
+// Context cancellation: if the workflow's context is cancelled while the step is running,
+// the step's outcome is not checkpointed and RunAsStep returns a *DBOSError with code
+// WorkflowCancelled, wrapping the underlying context error. The workflow should return
+// promptly: it is marked CANCELLED and, when resumed, re-executes the interrupted step.
+// Do not swallow this error to run further durable work — replay after resume would diverge.
+// By contrast, cancelling a context that wraps only the step (e.g. a per-step timeout)
+// records the step's error as its durable outcome and the workflow continues normally.
 func RunAsStep[R any](ctx DBOSContext, fn Step[R], opts ...StepOption) (R, error) {
 	if ctx == nil {
 		return *new(R), newStepExecutionError("", "", fmt.Errorf("ctx cannot be nil"))
@@ -2045,6 +2146,10 @@ func (c *dbosContext) RunAsStep(_ DBOSContext, fn StepFunc, opts ...StepOption) 
 		}
 		return fn(stepCtx)
 	})
+
+	if stepInterruptedByCancellation(stepState, stepError) {
+		return stepOutput, newWorkflowCancelledError(stepState.workflowID, stepError)
+	}
 
 	// Serialize step output before recording
 	ser := resolveEncoder(c)
@@ -2209,6 +2314,10 @@ func (c *dbosContext) runAsTxn(_ DBOSContext, fn TxnFunc, opts ...StepOption) (a
 			}
 			return output, nil
 		})
+
+		if stepInterruptedByCancellation(stepState, stepError) {
+			return stepOutput, newWorkflowCancelledError(stepState.workflowID, stepError)
+		}
 
 		txnSer := resolveEncoder(c)
 		serialization := txnSer.Name()

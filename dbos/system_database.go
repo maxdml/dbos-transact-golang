@@ -810,8 +810,10 @@ func newSystemDatabase(ctx context.Context, inputs newSystemDatabaseInput) (syst
 		}
 		return nil, fmt.Errorf("failed to acquire connection to detect database type: %v", err)
 	}
-	defer conn.Release()
 	isCockroach := isCockroachDB(conn.Conn())
+	// Release before any error path calls pool.Close(): Close blocks until all
+	// acquired connections are returned, so a deferred Release would deadlock.
+	conn.Release()
 	if isCockroach {
 		logger.Info("Detected CockroachDB")
 	}
@@ -1526,23 +1528,45 @@ type updateWorkflowOutcomeDBInput struct {
 	tx         Tx
 }
 
-// updateWorkflowOutcome updates the status, output, and error of a workflow
-// Note that transitions from CANCELLED to SUCCESS or ERROR are forbidden
+// updateWorkflowOutcome records a workflow's terminal outcome. Only a PENDING row can
+// receive an outcome: any other status means the run was superseded (already terminal,
+// re-enqueued by a resume, ...). If the write is refused for any reason other than the workflow having
+// completed (SUCCESS/ERROR), returns a WorkflowCancelled error.
 func (s *sysDB) updateWorkflowOutcome(ctx context.Context, input updateWorkflowOutcomeDBInput) error {
 	query := s.renderSQL(`UPDATE %sworkflow_status
 			  SET status = $1, output = $2, error = $3, updated_at = $4, completed_at = $4, deduplication_id = NULL
-			  WHERE workflow_uuid = $5 AND NOT (status = $6 AND CAST($1 AS TEXT) IN ($7, $8))`, s.dialect.SchemaPrefix(s.schema))
+			  WHERE workflow_uuid = $5 AND status = $6`, s.dialect.SchemaPrefix(s.schema))
 
-	// input.output is already a *string from the database layer
-	var err error
+	var runner Querier = s.pool
 	if input.tx != nil {
-		_, err = input.tx.Exec(ctx, query, input.status, input.output, input.errStr, time.Now().UnixMilli(), input.workflowID, WorkflowStatusCancelled, WorkflowStatusSuccess, WorkflowStatusError)
-	} else {
-		_, err = s.pool.Exec(ctx, query, input.status, input.output, input.errStr, time.Now().UnixMilli(), input.workflowID, WorkflowStatusCancelled, WorkflowStatusSuccess, WorkflowStatusError)
+		runner = input.tx
 	}
 
+	// input.output is already a *string from the database layer
+	res, err := runner.Exec(ctx, query, input.status, input.output, input.errStr, time.Now().UnixMilli(), input.workflowID, WorkflowStatusPending)
 	if err != nil {
 		return fmt.Errorf("failed to update workflow status: %w", err)
+	}
+	rowsAffected, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to check workflow status update: %w", err)
+	}
+	if rowsAffected == 0 {
+		// The guarded UPDATE matched no rows. Re-read the status (only on this rare
+		// no-op path): if the workflow completed (SUCCESS/ERROR) the refusal is a
+		// no-op; otherwise the run was cancelled or superseded and is reported as
+		// cancelled to the caller.
+		statusQuery := s.renderSQL(`SELECT status FROM %sworkflow_status WHERE workflow_uuid = $1`, s.dialect.SchemaPrefix(s.schema))
+		var currentStatus WorkflowStatusType
+		if err := runner.QueryRow(ctx, statusQuery, input.workflowID).Scan(&currentStatus); err != nil {
+			if errors.Is(err, ErrNoRows) {
+				return nil
+			}
+			return fmt.Errorf("failed to read workflow status after refused outcome update: %w", err)
+		}
+		if currentStatus != WorkflowStatusSuccess && currentStatus != WorkflowStatusError {
+			return newWorkflowCancelledError(input.workflowID, nil)
+		}
 	}
 	return nil
 }
@@ -2639,7 +2663,7 @@ func (s *sysDB) checkOperationExecution(ctx context.Context, input checkOperatio
 
 	// If the workflow is cancelled, raise the exception
 	if workflowStatus == WorkflowStatusCancelled {
-		return nil, newWorkflowCancelledError(input.workflowID)
+		return nil, newWorkflowCancelledError(input.workflowID, nil)
 	}
 
 	// Execute second query to get operation outputs

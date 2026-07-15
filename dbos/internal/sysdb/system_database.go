@@ -5069,6 +5069,7 @@ func (s *SysDB) ListSchedules(ctx context.Context, input ListSchedulesDBInput) (
 				}
 			}
 		}
+		schedule.ContextJSON = contextJSON
 		if err := json.Unmarshal([]byte(contextJSON), &schedule.Context); err != nil {
 			schedule.Context = contextJSON
 		}

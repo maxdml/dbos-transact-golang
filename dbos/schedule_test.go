@@ -531,41 +531,39 @@ func TestCalculateScheduleSignature(t *testing.T) {
 		Schedule:          "* * * * *",
 		Status:            ScheduleStatusActive,
 		Context:           "ctx",
+		ContextJSON:       `"ctx"`,
 		LastFiredAt:       nil,
 		AutomaticBackfill: false,
 		CronTimezone:      "",
 		QueueName:         "",
 	}
-	sig, err := c.calculateSignature(base)
-	require.NoError(t, err)
+	sig := c.calculateSignature(base)
 
 	// Identity / lifecycle / runtime fields must NOT change the signature.
 	lastFired := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
 	unchanged := []WorkflowSchedule{
-		{ScheduleID: "id-2", ScheduleName: base.ScheduleName, WorkflowName: base.WorkflowName, Schedule: base.Schedule, Status: base.Status, Context: base.Context},
-		{ScheduleID: base.ScheduleID, ScheduleName: "other-name", WorkflowName: base.WorkflowName, Schedule: base.Schedule, Status: base.Status, Context: base.Context},
-		{ScheduleID: base.ScheduleID, ScheduleName: base.ScheduleName, WorkflowName: base.WorkflowName, Schedule: base.Schedule, Status: ScheduleStatusPaused, Context: base.Context},
-		{ScheduleID: base.ScheduleID, ScheduleName: base.ScheduleName, WorkflowName: base.WorkflowName, Schedule: base.Schedule, Status: base.Status, Context: base.Context, LastFiredAt: &lastFired},
-		{ScheduleID: base.ScheduleID, ScheduleName: base.ScheduleName, WorkflowName: base.WorkflowName, Schedule: base.Schedule, Status: base.Status, Context: base.Context, AutomaticBackfill: true},
+		{ScheduleID: "id-2", ScheduleName: base.ScheduleName, WorkflowName: base.WorkflowName, Schedule: base.Schedule, Status: base.Status, ContextJSON: base.ContextJSON},
+		{ScheduleID: base.ScheduleID, ScheduleName: "other-name", WorkflowName: base.WorkflowName, Schedule: base.Schedule, Status: base.Status, ContextJSON: base.ContextJSON},
+		{ScheduleID: base.ScheduleID, ScheduleName: base.ScheduleName, WorkflowName: base.WorkflowName, Schedule: base.Schedule, Status: ScheduleStatusPaused, ContextJSON: base.ContextJSON},
+		{ScheduleID: base.ScheduleID, ScheduleName: base.ScheduleName, WorkflowName: base.WorkflowName, Schedule: base.Schedule, Status: base.Status, ContextJSON: base.ContextJSON, LastFiredAt: &lastFired},
+		{ScheduleID: base.ScheduleID, ScheduleName: base.ScheduleName, WorkflowName: base.WorkflowName, Schedule: base.Schedule, Status: base.Status, ContextJSON: base.ContextJSON, AutomaticBackfill: true},
 	}
 	for i, s := range unchanged {
-		got, err := c.calculateSignature(s)
-		require.NoError(t, err)
+		got := c.calculateSignature(s)
 		require.Equal(t, sig, got, "case %d should not change signature", i)
 	}
 
 	// Definition fields MUST change the signature.
 	changed := []WorkflowSchedule{
-		{WorkflowName: "wf2", Schedule: base.Schedule, Context: base.Context},
-		{WorkflowName: base.WorkflowName, WorkflowClassName: "SomeClass", Schedule: base.Schedule, Context: base.Context},
-		{WorkflowName: base.WorkflowName, Schedule: "0 * * * *", Context: base.Context},
-		{WorkflowName: base.WorkflowName, Schedule: base.Schedule, Context: "ctx2"},
-		{WorkflowName: base.WorkflowName, Schedule: base.Schedule, Context: base.Context, CronTimezone: "America/Los_Angeles"},
-		{WorkflowName: base.WorkflowName, Schedule: base.Schedule, Context: base.Context, QueueName: "q"},
+		{WorkflowName: "wf2", Schedule: base.Schedule, ContextJSON: base.ContextJSON},
+		{WorkflowName: base.WorkflowName, WorkflowClassName: "SomeClass", Schedule: base.Schedule, ContextJSON: base.ContextJSON},
+		{WorkflowName: base.WorkflowName, Schedule: "0 * * * *", ContextJSON: base.ContextJSON},
+		{WorkflowName: base.WorkflowName, Schedule: base.Schedule, ContextJSON: `"ctx2"`},
+		{WorkflowName: base.WorkflowName, Schedule: base.Schedule, ContextJSON: base.ContextJSON, CronTimezone: "America/Los_Angeles"},
+		{WorkflowName: base.WorkflowName, Schedule: base.Schedule, ContextJSON: base.ContextJSON, QueueName: "q"},
 	}
 	for i, s := range changed {
-		got, err := c.calculateSignature(s)
-		require.NoError(t, err)
+		got := c.calculateSignature(s)
 		require.NotEqual(t, sig, got, "case %d should change signature", i)
 	}
 }

@@ -1,9 +1,6 @@
 package dbos
 
 import (
-	"bytes"
-	"crypto/sha256"
-	"encoding/json"
 	"fmt"
 	"math/rand/v2"
 	"sync/atomic"
@@ -200,11 +197,7 @@ func (c *dbosContext) buildDBScheduleFunc(schedule WorkflowSchedule) ScheduledWo
 }
 
 func (c *dbosContext) addDBScheduleToScheduler(schedule WorkflowSchedule) {
-	sig, err := c.calculateSignature(schedule)
-	if err != nil {
-		c.logger.Error("failed to calculate signature", "error", err)
-		return
-	}
+	sig := c.calculateSignature(schedule)
 
 	fn := c.buildDBScheduleFunc(schedule)
 
@@ -270,30 +263,31 @@ func (c *dbosContext) runScheduleReconciler() {
 	}
 }
 
-// calculateSignature hashes definition fields only (not identity/lifecycle/runtime state).
-func (c *dbosContext) calculateSignature(s WorkflowSchedule) ([]byte, error) {
-	sig := struct {
-		WorkflowName      string `json:"workflow_name"`
-		WorkflowClassName string `json:"workflow_class_name"`
-		Schedule          string `json:"schedule"`
-		Context           any    `json:"context"`
-		CronTimezone      string `json:"cron_timezone"`
-		QueueName         string `json:"queue_name"`
-	}{
-		s.WorkflowName,
-		s.WorkflowClassName,
-		s.Schedule,
-		s.Context,
-		s.CronTimezone,
-		s.QueueName,
-	}
+// scheduleSignature holds definition fields used to detect when an installed
+// cron entry must be restarted after ApplySchedules / reconciler updates.
+// Identity, lifecycle, and runtime fields (schedule_id, status, last_fired_at,
+// automatic_backfill) are intentionally omitted. All fields are comparable so
+// signatures can be checked with ==; ContextJSON is the raw DB column rather
+// than decoded Context (any), which is not comparable.
+type scheduleSignature struct {
+	WorkflowName      string
+	WorkflowClassName string
+	Schedule          string
+	ContextJSON       string
+	CronTimezone      string
+	QueueName         string
+}
 
-	buf, err := json.Marshal(&sig)
-	if err != nil {
-		return nil, err
+// calculateSignature extracts definition fields for equality comparison.
+func (c *dbosContext) calculateSignature(s WorkflowSchedule) scheduleSignature {
+	return scheduleSignature{
+		WorkflowName:      s.WorkflowName,
+		WorkflowClassName: s.WorkflowClassName,
+		Schedule:          s.Schedule,
+		ContextJSON:       s.ContextJSON,
+		CronTimezone:      s.CronTimezone,
+		QueueName:         s.QueueName,
 	}
-	sum := sha256.Sum256(buf)
-	return sum[:], nil
 }
 
 func (c *dbosContext) maybeAutomaticBackfill(sched *WorkflowSchedule) {
@@ -356,12 +350,8 @@ func (c *dbosContext) reconcileSchedules() {
 
 		if exists {
 			// Running — restart on a changed definition; no backfill needed.
-			sig, err := c.calculateSignature(*sched)
-			if err != nil {
-				c.logger.Error("failed to calculate signature", "schedule", name, "error", err)
-				continue
-			}
-			if bytes.Equal(installedSig, sig) {
+			sig := c.calculateSignature(*sched)
+			if installedSig == sig {
 				continue
 			}
 			c.removeDBScheduleFromScheduler(name)

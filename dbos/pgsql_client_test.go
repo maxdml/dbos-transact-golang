@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dbos-inc/dbos-transact-golang/dbos/internal/sysdb"
+
 	"github.com/jackc/pgerrcode"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -88,8 +90,8 @@ func TestPgsqlClient(t *testing.T) {
 	skipIfSqlite(t, "exercises pg/CRDB plpgsql stored functions; sqlite has none")
 	serverCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true})
 
-	pool := PgxPool(serverCtx.(*dbosContext).systemDB.(*sysDB).pool)
-	schema := serverCtx.(*dbosContext).systemDB.(*sysDB).schema
+	pool := PgxPool(serverCtx.(*dbosContext).systemDB.Pool())
+	schema := serverCtx.(*dbosContext).systemDB.(*sysdb.SysDB).Schema()
 
 	queue := NewWorkflowQueue(serverCtx, "pgsql-test-queue")
 

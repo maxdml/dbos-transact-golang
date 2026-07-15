@@ -13,6 +13,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dbos-inc/dbos-transact-golang/dbos/internal/models"
+	"github.com/dbos-inc/dbos-transact-golang/dbos/internal/sysdb"
+
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -564,7 +567,7 @@ func TestCancelResume(t *testing.T) {
 		assert.Equal(t, WorkflowStatusSuccess, finalStatus.Status, "expected final workflow status to be SUCCESS")
 
 		// After resume, the queue name should change to the internal queue name
-		assert.Equal(t, _DBOS_INTERNAL_QUEUE_NAME, finalStatus.QueueName, "expected queue name to be %s", _DBOS_INTERNAL_QUEUE_NAME)
+		assert.Equal(t, models.InternalQueueName, finalStatus.QueueName, "expected queue name to be %s", models.InternalQueueName)
 
 		// Resume the workflow again - should not run again
 		resumeAgainHandle, err := client.ResumeWorkflow(workflowID)
@@ -906,12 +909,12 @@ func TestForkWorkflow(t *testing.T) {
 			// Get database pool from serverCtx to query workflow_events_history
 			dbosCtx, ok := serverCtx.(*dbosContext)
 			require.True(t, ok, "expected dbosContext")
-			sysDB, ok := dbosCtx.systemDB.(*sysDB)
+			sysDB, ok := dbosCtx.systemDB.(*sysdb.SysDB)
 			require.True(t, ok, "expected sysDB")
 
 			// Query all events from workflow_events_history
-			query := sysDB.renderSQL(`SELECT function_id, key, value FROM %sworkflow_events_history WHERE workflow_uuid = $1 ORDER BY function_id, key`, sysDB.dialect.SchemaPrefix(sysDB.schema))
-			rows, err := sysDB.pool.Query(context.Background(), query, forkedWorkflowID)
+			query := sysDB.RenderSQL(`SELECT function_id, key, value FROM %sworkflow_events_history WHERE workflow_uuid = $1 ORDER BY function_id, key`, sysDB.Dialect().SchemaPrefix(sysDB.Schema()))
+			rows, err := sysDB.Pool().Query(context.Background(), query, forkedWorkflowID)
 			require.NoError(t, err, "failed to query workflow_events_history for forked workflow at step %d", startStep)
 			defer rows.Close()
 
@@ -1635,9 +1638,9 @@ func TestDebouncerClient(t *testing.T) {
 	serverCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true})
 
 	// Set internal queue polling interval to 10ms for faster tests
-	internalQueue := serverCtx.(*dbosContext).queueRunner.workflowQueueRegistry[_DBOS_INTERNAL_QUEUE_NAME]
+	internalQueue := serverCtx.(*dbosContext).queueRunner.workflowQueueRegistry[models.InternalQueueName]
 	internalQueue.basePollingInterval = 10 * time.Millisecond
-	serverCtx.(*dbosContext).queueRunner.workflowQueueRegistry[_DBOS_INTERNAL_QUEUE_NAME] = internalQueue
+	serverCtx.(*dbosContext).queueRunner.workflowQueueRegistry[models.InternalQueueName] = internalQueue
 
 	// Register test workflow with a custom name
 	debounceTestWorkflow := func(ctx DBOSContext, input string) (string, error) {
@@ -1685,11 +1688,11 @@ func TestDebouncerClient(t *testing.T) {
 		// CockroachDB has longer notification latency due to polling. Only pg
 		// backends expose a *pgxpool.Pool we can sniff; sqlite is never CRDB.
 		isCockroach := false
-		if pgxPool := PgxPool(serverCtx.(*dbosContext).systemDB.(*sysDB).pool); pgxPool != nil {
+		if pgxPool := PgxPool(serverCtx.(*dbosContext).systemDB.Pool()); pgxPool != nil {
 			conn, err := pgxPool.Acquire(serverCtx)
 			require.NoError(t, err)
 			defer conn.Release()
-			isCockroach = isCockroachDB(conn.Conn())
+			isCockroach = sysdb.IsCockroachDB(conn.Conn())
 		}
 
 		var delay time.Duration
@@ -1838,9 +1841,9 @@ func TestDebouncerClientConfiguredInstance(t *testing.T) {
 	serverCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true})
 
 	// Set internal queue polling interval to 10ms for faster tests
-	internalQueue := serverCtx.(*dbosContext).queueRunner.workflowQueueRegistry[_DBOS_INTERNAL_QUEUE_NAME]
+	internalQueue := serverCtx.(*dbosContext).queueRunner.workflowQueueRegistry[models.InternalQueueName]
 	internalQueue.basePollingInterval = 10 * time.Millisecond
-	serverCtx.(*dbosContext).queueRunner.workflowQueueRegistry[_DBOS_INTERNAL_QUEUE_NAME] = internalQueue
+	serverCtx.(*dbosContext).queueRunner.workflowQueueRegistry[models.InternalQueueName] = internalQueue
 
 	// Two configured instances of the same workflow method, sharing a custom name
 	slackNotifier := &configuredNotifier{channel: "slack"}
@@ -2169,7 +2172,7 @@ func TestClientSchedules(t *testing.T) {
 		a, err := c.GetSchedule(nameA)
 		require.NoError(t, err)
 		require.NotNil(t, a)
-		require.Equal(t, _DBOS_INTERNAL_QUEUE_NAME, a.QueueName, "QueueName should default to the internal queue")
+		require.Equal(t, models.InternalQueueName, a.QueueName, "QueueName should default to the internal queue")
 		require.Equal(t, map[string]any{"region": "us"}, a.Context)
 		scheduleIDA := a.ScheduleID
 
@@ -2289,8 +2292,8 @@ func TestClientApplicationVersions(t *testing.T) {
 
 		// Seed an older version directly so it sorts before the current one.
 		sysDB := serverCtx.(*dbosContext).systemDB
-		require.NoError(t, sysDB.createApplicationVersion(serverCtx, "older-version"))
-		require.NoError(t, sysDB.updateApplicationVersionTimestamp(serverCtx, "older-version", time.Now().Add(-time.Hour).UnixMilli()))
+		require.NoError(t, sysDB.CreateApplicationVersion(serverCtx, "older-version"))
+		require.NoError(t, sysDB.UpdateApplicationVersionTimestamp(serverCtx, "older-version", time.Now().Add(-time.Hour).UnixMilli()))
 
 		latest, err := c.GetLatestApplicationVersion()
 		require.NoError(t, err)
@@ -2316,8 +2319,8 @@ func TestClientApplicationVersions(t *testing.T) {
 		require.NoError(t, err)
 		t.Cleanup(func() { c.Shutdown(30 * time.Second) })
 		// Launch registers the current version; clear table to simulate empty state.
-		s := serverCtx.(*dbosContext).systemDB.(*sysDB)
-		_, err = s.pool.Exec(serverCtx, s.renderSQL("DELETE FROM %sapplication_versions", s.dialect.SchemaPrefix(s.schema)))
+		s := serverCtx.(*dbosContext).systemDB.(*sysdb.SysDB)
+		_, err = s.Pool().Exec(serverCtx, s.RenderSQL("DELETE FROM %sapplication_versions", s.Dialect().SchemaPrefix(s.Schema())))
 		require.NoError(t, err)
 
 		_, err = c.GetLatestApplicationVersion()
@@ -2378,10 +2381,10 @@ func TestClientCustomSqliteDB(t *testing.T) {
 	require.True(t, ok)
 	dbosCtx, ok := clientImpl.dbosCtx.(*dbosContext)
 	require.True(t, ok)
-	sysDB, ok := dbosCtx.systemDB.(*sysDB)
+	sysDB, ok := dbosCtx.systemDB.(*sysdb.SysDB)
 	require.True(t, ok)
-	assert.Same(t, clientDB, SQLDB(sysDB.pool), "client should use the caller's sqlite *sql.DB")
-	require.Equal(t, DialectSQLite, sysDB.dialect.Name())
+	assert.Same(t, clientDB, SQLDB(sysDB.Pool()), "client should use the caller's sqlite *sql.DB")
+	require.Equal(t, DialectSQLite, sysDB.Dialect().Name())
 
 	handle, err := Enqueue[wfInput, string](c, queue.Name, "CustomSqliteClientWorkflow",
 		wfInput{Input: "hello"},
@@ -2424,10 +2427,10 @@ func TestClientCustomPool(t *testing.T) {
 	require.True(t, ok)
 	dbosCtx, ok := clientImpl.dbosCtx.(*dbosContext)
 	require.True(t, ok)
-	sysDB, ok := dbosCtx.systemDB.(*sysDB)
+	sysDB, ok := dbosCtx.systemDB.(*sysdb.SysDB)
 	require.True(t, ok)
-	assert.Same(t, clientPool, PgxPool(sysDB.pool), "client should use the caller's *pgxpool.Pool")
-	require.Contains(t, []DialectName{DialectPostgres, DialectCockroach}, sysDB.dialect.Name())
+	assert.Same(t, clientPool, PgxPool(sysDB.Pool()), "client should use the caller's *pgxpool.Pool")
+	require.Contains(t, []DialectName{DialectPostgres, DialectCockroach}, sysDB.Dialect().Name())
 
 	handle, err := Enqueue[wfInput, string](c, queue.Name, "CustomPoolClientWorkflow",
 		wfInput{Input: "hello"},

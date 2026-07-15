@@ -17,6 +17,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/dbos-inc/dbos-transact-golang/dbos/internal/models"
+	"github.com/dbos-inc/dbos-transact-golang/dbos/internal/sysdb"
+
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/robfig/cron/v3"
@@ -61,7 +64,7 @@ func processConfig(inputConfig *Config) (*Config, error) {
 		return nil, fmt.Errorf("missing required config field: appName")
 	}
 	if inputConfig.SystemDBPool == nil && inputConfig.SqliteSystemDB == nil {
-		if _, err := detectDialect(inputConfig.DatabaseURL); err != nil {
+		if _, err := sysdb.DetectDialect(inputConfig.DatabaseURL); err != nil {
 			return nil, err
 		}
 	}
@@ -127,7 +130,7 @@ func processConfig(inputConfig *Config) (*Config, error) {
 }
 
 // AlertHandler is a function that handles alerts received from DBOS Conductor.
-type AlertHandler func(name string, message string, metadata map[string]string)
+type AlertHandler = models.AlertHandler
 
 // DBOSContext represents a DBOS execution context that provides workflow orchestration capabilities.
 // It extends the standard Go context.Context and adds methods for running workflows and steps,
@@ -227,7 +230,7 @@ type dbosContext struct {
 
 	launched atomic.Bool
 
-	systemDB    systemDatabase
+	systemDB    sysdb.SystemDatabase
 	adminServer *adminServer
 	config      *Config
 
@@ -301,7 +304,7 @@ func (c *dbosContext) ClearRegistries() {
 	c.workflowRegistry.Clear()
 	c.workflowCustomNametoFQN.Clear()
 	for name := range c.queueRunner.workflowQueueRegistry {
-		if name != _DBOS_INTERNAL_QUEUE_NAME {
+		if name != models.InternalQueueName {
 			delete(c.queueRunner.workflowQueueRegistry, name)
 		}
 	}
@@ -324,16 +327,12 @@ func (c *dbosContext) Value(key any) any {
 	return c.ctx.Value(key)
 }
 
-// From returns a copy of the current DBOSContext with the underlying context.Context set to the provided ctx.
-// The provided context must be a child of a context.Context that was provided by DBOS (e.g., the first argument of RunWorkflow or RunAsStep)
-// That is because such context embeds important metadata necessary for DBOS to function correctly.
-func (c *dbosContext) From(_ DBOSContext, ctx context.Context) DBOSContext {
-	if ctx == nil {
-		return nil
-	}
-	launched := c.launched.Load()
+// clone returns a copy of the DBOS context with the underlying context.Context replaced by ctx.
+// Root-only lifecycle fields (cancel func, admin server, conductor, scheduler state, alert handler)
+// are deliberately not propagated to derived contexts.
+func (c *dbosContext) clone(ctx context.Context) *dbosContext {
 	childCtx := &dbosContext{
-		ctx:                     ctx, // Use the provided context
+		ctx:                     ctx,
 		config:                  c.config,
 		logger:                  c.logger,
 		systemDB:                c.systemDB,
@@ -347,8 +346,18 @@ func (c *dbosContext) From(_ DBOSContext, ctx context.Context) DBOSContext {
 		queueRunner:             c.queueRunner,
 		serializer:              c.serializer,
 	}
-	childCtx.launched.Store(launched)
+	childCtx.launched.Store(c.launched.Load())
 	return childCtx
+}
+
+// From returns a copy of the current DBOSContext with the underlying context.Context set to the provided ctx.
+// The provided context must be a child of a context.Context that was provided by DBOS (e.g., the first argument of RunWorkflow or RunAsStep)
+// That is because such context embeds important metadata necessary for DBOS to function correctly.
+func (c *dbosContext) From(_ DBOSContext, ctx context.Context) DBOSContext {
+	if ctx == nil {
+		return nil
+	}
+	return c.clone(ctx)
 }
 
 func From(dbosCtx DBOSContext, ctx context.Context) DBOSContext {
@@ -368,45 +377,11 @@ func WithValue(ctx DBOSContext, key, val any) DBOSContext {
 }
 
 func (c *dbosContext) WithValue(key, val any) DBOSContext {
-	launched := c.launched.Load()
-	childCtx := &dbosContext{
-		ctx:                     context.WithValue(c.ctx, key, val), // Spawn a new child context with the value set
-		config:                  c.config,
-		logger:                  c.logger,
-		systemDB:                c.systemDB,
-		workflowsWg:             c.workflowsWg,
-		workflowRegistry:        c.workflowRegistry,
-		workflowCustomNametoFQN: c.workflowCustomNametoFQN,
-		activeWorkflowIDs:       c.activeWorkflowIDs,
-		applicationVersion:      c.applicationVersion,
-		executorID:              c.executorID,
-		applicationID:           c.applicationID,
-		queueRunner:             c.queueRunner,
-		serializer:              c.serializer,
-	}
-	childCtx.launched.Store(launched)
-	return childCtx
+	return c.clone(context.WithValue(c.ctx, key, val))
 }
 
 func (c *dbosContext) WithoutCancel(_ DBOSContext) DBOSContext {
-	launched := c.launched.Load()
-	childCtx := &dbosContext{
-		ctx:                     context.WithoutCancel(c.ctx),
-		config:                  c.config,
-		logger:                  c.logger,
-		systemDB:                c.systemDB,
-		workflowsWg:             c.workflowsWg,
-		workflowRegistry:        c.workflowRegistry,
-		workflowCustomNametoFQN: c.workflowCustomNametoFQN,
-		activeWorkflowIDs:       c.activeWorkflowIDs,
-		applicationVersion:      c.applicationVersion,
-		executorID:              c.executorID,
-		applicationID:           c.applicationID,
-		queueRunner:             c.queueRunner,
-		serializer:              c.serializer,
-	}
-	childCtx.launched.Store(launched)
-	return childCtx
+	return c.clone(context.WithoutCancel(c.ctx))
 }
 
 // WithoutCancel returns a copy of the DBOS context that is not canceled when the parent context is canceled.
@@ -419,24 +394,8 @@ func WithoutCancel(ctx DBOSContext) DBOSContext {
 }
 
 func (c *dbosContext) WithCancel() (DBOSContext, context.CancelFunc) {
-	launched := c.launched.Load()
 	newCtx, cancelFunc := context.WithCancel(c.ctx)
-	childCtx := &dbosContext{
-		ctx:                     newCtx,
-		logger:                  c.logger,
-		systemDB:                c.systemDB,
-		workflowsWg:             c.workflowsWg,
-		workflowRegistry:        c.workflowRegistry,
-		workflowCustomNametoFQN: c.workflowCustomNametoFQN,
-		activeWorkflowIDs:       c.activeWorkflowIDs,
-		applicationVersion:      c.applicationVersion,
-		executorID:              c.executorID,
-		applicationID:           c.applicationID,
-		queueRunner:             c.queueRunner,
-		serializer:              c.serializer,
-	}
-	childCtx.launched.Store(launched)
-	return childCtx, cancelFunc
+	return c.clone(newCtx), cancelFunc
 }
 
 // WithCancel returns a copy of the DBOS context that can be manually canceled.
@@ -450,24 +409,8 @@ func WithCancel(ctx DBOSContext) (DBOSContext, context.CancelFunc) {
 }
 
 func (c *dbosContext) WithCancelCause() (DBOSContext, context.CancelCauseFunc) {
-	launched := c.launched.Load()
 	newCtx, cancelCauseFunc := context.WithCancelCause(c.ctx)
-	childCtx := &dbosContext{
-		ctx:                     newCtx,
-		logger:                  c.logger,
-		systemDB:                c.systemDB,
-		workflowsWg:             c.workflowsWg,
-		workflowRegistry:        c.workflowRegistry,
-		workflowCustomNametoFQN: c.workflowCustomNametoFQN,
-		activeWorkflowIDs:       c.activeWorkflowIDs,
-		applicationVersion:      c.applicationVersion,
-		executorID:              c.executorID,
-		applicationID:           c.applicationID,
-		queueRunner:             c.queueRunner,
-		serializer:              c.serializer,
-	}
-	childCtx.launched.Store(launched)
-	return childCtx, cancelCauseFunc
+	return c.clone(newCtx), cancelCauseFunc
 }
 
 // WithCancelCause returns a copy of the DBOS context that can be canceled with a cause.
@@ -480,25 +423,8 @@ func WithCancelCause(ctx DBOSContext) (DBOSContext, context.CancelCauseFunc) {
 }
 
 func (c *dbosContext) WithTimeout(_ DBOSContext, timeout time.Duration) (DBOSContext, context.CancelFunc) {
-	launched := c.launched.Load()
 	newCtx, cancelFunc := context.WithTimeoutCause(c.ctx, timeout, errors.New("DBOS context timeout"))
-	childCtx := &dbosContext{
-		ctx:                     newCtx,
-		config:                  c.config,
-		logger:                  c.logger,
-		systemDB:                c.systemDB,
-		workflowsWg:             c.workflowsWg,
-		workflowRegistry:        c.workflowRegistry,
-		workflowCustomNametoFQN: c.workflowCustomNametoFQN,
-		activeWorkflowIDs:       c.activeWorkflowIDs,
-		applicationVersion:      c.applicationVersion,
-		executorID:              c.executorID,
-		applicationID:           c.applicationID,
-		queueRunner:             c.queueRunner,
-		serializer:              c.serializer,
-	}
-	childCtx.launched.Store(launched)
-	return childCtx, cancelFunc
+	return c.clone(newCtx), cancelFunc
 }
 
 // WithTimeout returns a copy of the DBOS context that is canceled after the given timeout.
@@ -601,7 +527,7 @@ func NewDBOSContext(ctx context.Context, inputConfig Config) (DBOSContext, error
 	// Load and process the configuration
 	config, err := processConfig(&inputConfig)
 	if err != nil {
-		return nil, newInitializationError(err.Error())
+		return nil, models.NewInitializationError(err.Error())
 	}
 	initExecutor.config = config
 
@@ -616,27 +542,35 @@ func NewDBOSContext(ctx context.Context, inputConfig Config) (DBOSContext, error
 	initExecutor.applicationID = os.Getenv("DBOS__APPID")
 	initExecutor.serializer = config.Serializer
 
-	newSystemDatabaseInputs := newSystemDatabaseInput{
-		databaseURL:     config.DatabaseURL,
-		databaseSchema:  config.DatabaseSchema,
-		customPool:      config.SystemDBPool,
-		customSqliteDB:  config.SqliteSystemDB,
-		logger:          initExecutor.logger,
-		applicationName: config.AppName,
+	newSystemDatabaseInputs := sysdb.NewSystemDatabaseInput{
+		DatabaseURL:     config.DatabaseURL,
+		DatabaseSchema:  config.DatabaseSchema,
+		CustomPool:      config.SystemDBPool,
+		CustomSqliteDB:  config.SqliteSystemDB,
+		Logger:          initExecutor.logger,
+		ApplicationName: config.AppName,
+		EncodeScheduledInput: func(ctx context.Context, scheduledTime time.Time, scheduleContext any) (*string, string, error) {
+			ser := resolveEncoder(ctx)
+			encoded, err := ser.Encode(ScheduledWorkflowInput{
+				ScheduledTime: scheduledTime,
+				Context:       scheduleContext,
+			})
+			return encoded, ser.Name(), err
+		},
 	}
 
 	// Create the system database
-	systemDB, err := newSystemDatabase(initExecutor, newSystemDatabaseInputs)
+	systemDB, err := sysdb.NewSystemDatabase(initExecutor, newSystemDatabaseInputs)
 	if err != nil {
 		initExecutor.logger.Error("failed to create system database", "error", err)
-		return nil, newInitializationError(err.Error())
+		return nil, models.NewInitializationError(err.Error())
 	}
 	initExecutor.systemDB = systemDB
 	initExecutor.logger.Debug("System database initialized")
 
 	// Initialize the queue runner and register DBOS internal queue
 	initExecutor.queueRunner = newQueueRunner(initExecutor.logger)
-	NewWorkflowQueue(initExecutor, _DBOS_INTERNAL_QUEUE_NAME)
+	NewWorkflowQueue(initExecutor, models.InternalQueueName)
 
 	// Register the any,any internal debouncer workflow so it's always available for execution
 	// This allows a client to debounce workflow and the server side to run them, even without knowing the actual workflow types
@@ -678,7 +612,7 @@ func NewDBOSContext(ctx context.Context, inputConfig Config) (DBOSContext, error
 	if conductorCfg != nil {
 		conductor, err := newConductor(initExecutor, *conductorCfg)
 		if err != nil {
-			return nil, newInitializationError(fmt.Sprintf("failed to initialize conductor: %v", err))
+			return nil, models.NewInitializationError(fmt.Sprintf("failed to initialize conductor: %v", err))
 		}
 		initExecutor.conductor = conductor
 		initExecutor.logger.Debug("Conductor initialized")
@@ -694,20 +628,20 @@ func NewDBOSContext(ctx context.Context, inputConfig Config) (DBOSContext, error
 // Returns an error if the context is already launched or if any component fails to start.
 func (c *dbosContext) Launch() error {
 	if c.launched.Load() {
-		return newInitializationError("DBOS is already launched")
+		return models.NewInitializationError("DBOS is already launched")
 	}
 
 	// Start the system database
-	c.systemDB.launch(c)
+	c.systemDB.Launch(c)
 
 	// Register the current application version and warn if it is not the latest.
-	if err := retry(c, func() error {
-		return c.systemDB.createApplicationVersion(c, c.applicationVersion)
-	}, withRetrierLogger(c.logger)); err != nil {
+	if err := sysdb.Retry(c, func() error {
+		return c.systemDB.CreateApplicationVersion(c, c.applicationVersion)
+	}, sysdb.WithRetrierLogger(c.logger)); err != nil {
 		c.logger.Warn("Failed to register application version", "version", c.applicationVersion, "error", err)
-	} else if latest, err := retryWithResult(c, func() (*VersionInfo, error) {
-		return c.systemDB.getLatestApplicationVersion(c, nil)
-	}, withRetrierLogger(c.logger)); err != nil {
+	} else if latest, err := sysdb.RetryWithResult(c, func() (*VersionInfo, error) {
+		return c.systemDB.GetLatestApplicationVersion(c, nil)
+	}, sysdb.WithRetrierLogger(c.logger)); err != nil {
 		c.logger.Warn("Failed to fetch latest application version", "error", err)
 	} else if latest.Name != c.applicationVersion {
 		c.logger.Warn("Current application version is not the latest",
@@ -720,7 +654,7 @@ func (c *dbosContext) Launch() error {
 		err := adminServer.Start()
 		if err != nil {
 			c.logger.Error("Failed to start admin server", "error", err)
-			return newInitializationError(fmt.Sprintf("failed to start admin server: %v", err))
+			return models.NewInitializationError(fmt.Sprintf("failed to start admin server: %v", err))
 		}
 		c.logger.Debug("Admin server started", "port", c.config.AdminServerPort)
 		c.adminServer = adminServer
@@ -749,7 +683,7 @@ func (c *dbosContext) Launch() error {
 	// Run a round of recovery on the local executor
 	recoveryHandles, err := recoverPendingWorkflows(c, []string{c.executorID})
 	if err != nil {
-		return newInitializationError(fmt.Sprintf("failed to recover pending workflows during launch: %v", err))
+		return models.NewInitializationError(fmt.Sprintf("failed to recover pending workflows during launch: %v", err))
 	}
 	if len(recoveryHandles) > 0 {
 		c.logger.Info("Recovered pending workflows", "count", len(recoveryHandles))
@@ -846,7 +780,7 @@ func (c *dbosContext) Shutdown(timeout time.Duration) {
 	// Close the system database
 	if c.systemDB != nil {
 		c.logger.Debug("Shutting down system database")
-		c.systemDB.shutdown(c, timeout)
+		c.systemDB.Shutdown(c, timeout)
 	}
 
 	c.launched.Store(false)

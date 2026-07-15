@@ -6,6 +6,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dbos-inc/dbos-transact-golang/dbos/internal/models"
+	"github.com/dbos-inc/dbos-transact-golang/dbos/internal/sysdb"
+
 	"github.com/robfig/cron/v3"
 	"github.com/stretchr/testify/require"
 )
@@ -140,7 +143,7 @@ func TestScheduleCRUD(t *testing.T) {
 				}
 			}
 			require.NotNil(t, found, "schedule %s should be listed", want)
-			require.Equal(t, _DBOS_INTERNAL_QUEUE_NAME, found.QueueName, "schedule %s should default to the internal queue", want)
+			require.Equal(t, models.InternalQueueName, found.QueueName, "schedule %s should default to the internal queue", want)
 		}
 
 		// Filter by status
@@ -496,7 +499,7 @@ func TestApplySchedulesPreservesRuntimeState(t *testing.T) {
 
 	require.NoError(t, PauseSchedule(dbosCtx, name))
 	lastFired := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
-	require.NoError(t, c.systemDB.updateScheduleLastFiredAt(c, name, lastFired))
+	require.NoError(t, c.systemDB.UpdateScheduleLastFiredAt(c, name, lastFired))
 
 	require.NoError(t, ApplySchedules(dbosCtx, []ApplySchedulesRequest{
 		{
@@ -711,7 +714,7 @@ func TestBackfillScheduleRecovery(t *testing.T) {
 	start := time.Now().Add(-5 * time.Second).Truncate(time.Second)
 	end := time.Now()
 	c := dbosCtx.(*dbosContext)
-	ids, err := c.systemDB.backfillSchedule(c, backfillScheduleDBInput{
+	ids, err := c.systemDB.BackfillSchedule(c, sysdb.BackfillScheduleDBInput{
 		ScheduleName: scheduleName,
 		Schedule:     "*/1 * * * * *",
 		StartTime:    start,
@@ -1145,15 +1148,15 @@ func TestScheduleNameSurvivesExportImport(t *testing.T) {
 	require.Equal(t, "export-test", original[0].ScheduleName)
 
 	// Export, delete, then reimport: schedule_name must survive the round-trip.
-	sdb := dbosCtx.(*dbosContext).systemDB.(*sysDB)
-	exported, err := sdb.exportWorkflow(dbosCtx, workflowID, true)
+	sdb := dbosCtx.(*dbosContext).systemDB.(*sysdb.SysDB)
+	exported, err := sdb.ExportWorkflow(dbosCtx, workflowID, true)
 	require.NoError(t, err)
 	require.NoError(t, DeleteWorkflows(dbosCtx, []string{workflowID}))
 	gone, err := ListWorkflows(dbosCtx, WithWorkflowIDs([]string{workflowID}))
 	require.NoError(t, err)
 	require.Empty(t, gone)
 
-	require.NoError(t, sdb.importWorkflow(dbosCtx, exported))
+	require.NoError(t, sdb.ImportWorkflow(dbosCtx, exported))
 	imported, err := ListWorkflows(dbosCtx, WithWorkflowIDs([]string{workflowID}))
 	require.NoError(t, err)
 	require.Len(t, imported, 1)

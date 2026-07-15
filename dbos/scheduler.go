@@ -9,41 +9,15 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/dbos-inc/dbos-transact-golang/dbos/internal/models"
+	"github.com/dbos-inc/dbos-transact-golang/dbos/internal/sysdb"
+
 	"github.com/robfig/cron/v3"
 )
 
 /*******************************/
 /******* SCHEDULE TYPES ********/
 /*******************************/
-
-type ScheduleStatus string
-
-const (
-	ScheduleStatusActive ScheduleStatus = "ACTIVE"
-	ScheduleStatusPaused ScheduleStatus = "PAUSED"
-)
-
-type WorkflowSchedule struct {
-	ScheduleID        string         `json:"schedule_id"`
-	ScheduleName      string         `json:"schedule_name"`
-	WorkflowName      string         `json:"workflow_name"`
-	WorkflowClassName string         `json:"workflow_class_name,omitempty"`
-	Schedule          string         `json:"schedule"`
-	Status            ScheduleStatus `json:"status"`
-	Context           any            `json:"context"`
-	LastFiredAt       *time.Time     `json:"last_fired_at,omitempty"`
-	AutomaticBackfill bool           `json:"automatic_backfill"`
-	CronTimezone      string         `json:"cron_timezone,omitempty"`
-	QueueName         string         `json:"queue_name,omitempty"`
-}
-
-// ScheduledWorkflowInput is the input type that DB-backed scheduled workflow
-// functions must accept. ScheduledTime is the cron tick time; Context carries
-// the user-defined value attached to the schedule (nil if none).
-type ScheduledWorkflowInput struct {
-	ScheduledTime time.Time `json:"scheduled_time"`
-	Context       any       `json:"context,omitempty"`
-}
 
 type ApplySchedulesRequest struct {
 	ScheduleName      string
@@ -60,10 +34,6 @@ const (
 	_SCHEDULE_MAX_JITTER            = 10 * time.Second
 )
 
-func newScheduleCronParser() cron.Parser {
-	return cron.NewParser(cron.Second | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow | cron.Descriptor)
-}
-
 func validateCronSchedule(spec, cronTimezone string) error {
 	if spec == "" {
 		return fmt.Errorf("schedule is required")
@@ -72,7 +42,7 @@ func validateCronSchedule(spec, cronTimezone string) error {
 	if cronTimezone != "" {
 		full = "CRON_TZ=" + cronTimezone + " " + spec
 	}
-	if _, err := newScheduleCronParser().Parse(full); err != nil {
+	if _, err := models.NewScheduleCronParser().Parse(full); err != nil {
 		return fmt.Errorf("invalid cron schedule %q: %w", spec, err)
 	}
 	return nil
@@ -151,16 +121,16 @@ func (c *dbosContext) buildDBScheduleFunc(schedule WorkflowSchedule) ScheduledWo
 	scheduleName := schedule.ScheduleName
 	queueName := schedule.QueueName
 	if queueName == "" {
-		queueName = _DBOS_INTERNAL_QUEUE_NAME
+		queueName = models.InternalQueueName
 	}
 
 	return func(ctx DBOSContext, input ScheduledWorkflowInput) (any, error) {
 		wfID := fmt.Sprintf("sched-%s-%s", scheduleName, input.ScheduledTime.Format(time.RFC3339))
 
 		// Skip if this tick's workflow already exists. Another executor may have enqueued it.
-		existing, err := retryWithResult(c, func() ([]WorkflowStatus, error) {
-			return c.systemDB.listWorkflows(c, listWorkflowsDBInput{workflowIDs: []string{wfID}})
-		}, withRetrierLogger(c.logger))
+		existing, err := sysdb.RetryWithResult(c, func() ([]WorkflowStatus, error) {
+			return c.systemDB.ListWorkflows(c, sysdb.ListWorkflowsDBInput{WorkflowIDs: []string{wfID}})
+		}, sysdb.WithRetrierLogger(c.logger))
 		if err != nil {
 			c.logger.Error("failed to check existing scheduled workflow", "schedule", scheduleName, "workflow_id", wfID, "error", err)
 			return nil, err
@@ -179,9 +149,9 @@ func (c *dbosContext) buildDBScheduleFunc(schedule WorkflowSchedule) ScheduledWo
 		// Scheduled workflows always run against the latest registered application version, so a stale executor does not pick them up after a new deploy.
 		// If lookup fails, leave the version unset: NULL rows are only dequeued by executors on the latest version.
 		var appVersion string
-		latest, err := retryWithResult(c, func() (*VersionInfo, error) {
-			return c.systemDB.getLatestApplicationVersion(c, nil)
-		}, withRetrierLogger(c.logger))
+		latest, err := sysdb.RetryWithResult(c, func() (*VersionInfo, error) {
+			return c.systemDB.GetLatestApplicationVersion(c, nil)
+		}, sysdb.WithRetrierLogger(c.logger))
 		if err != nil {
 			c.logger.Error("failed to fetch latest application version for scheduled workflow", "schedule", scheduleName, "workflow_id", wfID, "error", err)
 		} else if latest != nil {
@@ -204,24 +174,24 @@ func (c *dbosContext) buildDBScheduleFunc(schedule WorkflowSchedule) ScheduledWo
 		}
 
 		uncancellableCtx := WithoutCancel(c)
-		if err := retry(c, func() error {
-			tx, err := c.systemDB.(*sysDB).pool.BeginTx(uncancellableCtx, TxOptions{})
+		if err := sysdb.Retry(c, func() error {
+			tx, err := c.systemDB.Pool().BeginTx(uncancellableCtx, TxOptions{})
 			if err != nil {
 				return fmt.Errorf("failed to begin transaction: %w", err)
 			}
 			defer tx.Rollback(uncancellableCtx)
-			if _, err := c.systemDB.insertWorkflowStatus(uncancellableCtx, insertWorkflowStatusDBInput{status: status, tx: tx}); err != nil {
+			if _, err := c.systemDB.InsertWorkflowStatus(uncancellableCtx, sysdb.InsertWorkflowStatusDBInput{Status: status, Tx: tx}); err != nil {
 				return err
 			}
 			return tx.Commit(uncancellableCtx)
-		}, withRetrierLogger(c.logger)); err != nil {
+		}, sysdb.WithRetrierLogger(c.logger)); err != nil {
 			c.logger.Error("failed to enqueue scheduled workflow", "schedule", scheduleName, "workflow_id", wfID, "error", err)
 			return nil, err
 		}
 
-		if err := retry(c, func() error {
-			return c.systemDB.updateScheduleLastFiredAt(uncancellableCtx, scheduleName, time.Now())
-		}, withRetrierLogger(c.logger)); err != nil {
+		if err := sysdb.Retry(c, func() error {
+			return c.systemDB.UpdateScheduleLastFiredAt(uncancellableCtx, scheduleName, time.Now())
+		}, sysdb.WithRetrierLogger(c.logger)); err != nil {
 			c.logger.Error("failed to update schedule last fired time after retries", "schedule", scheduleName, "error", err)
 		}
 
@@ -336,7 +306,7 @@ func (c *dbosContext) maybeAutomaticBackfill(sched *WorkflowSchedule) {
 		return
 	}
 	c.logger.Info("performing automatic backfill", "schedule", sched.ScheduleName, "start", start, "end", end)
-	if _, err := c.systemDB.backfillSchedule(c, backfillScheduleDBInput{
+	if _, err := c.systemDB.BackfillSchedule(c, sysdb.BackfillScheduleDBInput{
 		ScheduleName: sched.ScheduleName,
 		Schedule:     sched.Schedule,
 		StartTime:    start,
@@ -347,7 +317,7 @@ func (c *dbosContext) maybeAutomaticBackfill(sched *WorkflowSchedule) {
 }
 
 func (c *dbosContext) reconcileSchedules() {
-	schedules, err := c.systemDB.listSchedules(c, listSchedulesDBInput{})
+	schedules, err := c.systemDB.ListSchedules(c, sysdb.ListSchedulesDBInput{})
 	if err != nil {
 		c.logger.Warn("failed to list schedules for reconciler", "error", err)
 		return

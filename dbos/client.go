@@ -10,6 +10,9 @@ import (
 	"math"
 	"time"
 
+	"github.com/dbos-inc/dbos-transact-golang/dbos/internal/models"
+	"github.com/dbos-inc/dbos-transact-golang/dbos/internal/sysdb"
+
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -96,7 +99,7 @@ func NewClient(ctx context.Context, config ClientConfig) (Client, error) {
 
 	asDBOSCtx, ok := dbosCtx.(*dbosContext)
 	if ok {
-		asDBOSCtx.systemDB.launch(asDBOSCtx)
+		asDBOSCtx.systemDB.Launch(asDBOSCtx)
 	}
 
 	return &client{
@@ -360,25 +363,25 @@ func (c *client) Enqueue(queueName, workflowName string, input any, opts ...Enqu
 	returnExisting := params.deduplicationPolicy == DeduplicationPolicyReturnExisting
 
 	for {
-		tx, err := dbosCtx.systemDB.(*sysDB).pool.BeginTx(uncancellableCtx, TxOptions{})
+		tx, err := dbosCtx.systemDB.Pool().BeginTx(uncancellableCtx, TxOptions{})
 		if err != nil {
-			return nil, newWorkflowExecutionError(workflowID, fmt.Errorf("failed to begin transaction: %v", err))
+			return nil, models.NewWorkflowExecutionError(workflowID, fmt.Errorf("failed to begin transaction: %v", err))
 		}
 
 		// Insert workflow status with transaction
-		insertInput := insertWorkflowStatusDBInput{
-			status: status,
-			tx:     tx,
+		insertInput := sysdb.InsertWorkflowStatusDBInput{
+			Status: status,
+			Tx:     tx,
 		}
-		_, err = dbosCtx.systemDB.insertWorkflowStatus(uncancellableCtx, insertInput)
+		_, err = dbosCtx.systemDB.InsertWorkflowStatus(uncancellableCtx, insertInput)
 		if err != nil {
 			if rbErr := tx.Rollback(uncancellableCtx); rbErr != nil {
 				dbosCtx.logger.Warn("failed to roll back transaction", "error", rbErr, "workflow_id", workflowID)
 			}
 			if returnExisting && errors.Is(err, &DBOSError{Code: QueueDeduplicated}) {
-				existingID, lookupErr := dbosCtx.systemDB.getDeduplicatedWorkflow(uncancellableCtx, queueName, params.deduplicationID)
+				existingID, lookupErr := dbosCtx.systemDB.GetDeduplicatedWorkflow(uncancellableCtx, queueName, params.deduplicationID)
 				if lookupErr != nil {
-					return nil, newWorkflowExecutionError(workflowID, fmt.Errorf("looking up deduplicated workflow: %w", lookupErr))
+					return nil, models.NewWorkflowExecutionError(workflowID, fmt.Errorf("looking up deduplicated workflow: %w", lookupErr))
 				}
 				if existingID != nil {
 					return newWorkflowPollingHandle[any](uncancellableCtx, *existingID), nil
@@ -549,24 +552,16 @@ func ClientRetrieveWorkflow[R any](c Client, workflowID string) (WorkflowHandle[
 	return typedClientHandle[R](c, handle), nil
 }
 
-// CancelWorkflowOption is a function option for configuring workflow cancelling parameters.
-type CancelWorkflowOptions func(*cancelWorkflowOptions)
-
 // WithChildren enables cancellation for children workflows
 func WithCancelChildren() CancelWorkflowOptions {
-	return func(cwo *cancelWorkflowOptions) {
-		cwo.cancelChildren = true
+	return func(cwo *models.CancelWorkflowInput) {
+		cwo.CancelChildren = true
 	}
-}
-
-// cancelWorkflowOptions holds configuration parameter for cancelling workflows.
-type cancelWorkflowOptions struct {
-	cancelChildren bool
 }
 
 // CancelWorkflow cancels a running or enqueued workflow.
 func (c *client) CancelWorkflow(workflowID string, opts ...CancelWorkflowOptions) error {
-	cwo := cancelWorkflowOptions{}
+	cwo := models.CancelWorkflowInput{}
 	for _, opt := range opts {
 		opt(&cwo)
 	}
@@ -583,7 +578,7 @@ func (c *client) UpdateWorkflowAttributes(workflowID string, attributes map[stri
 // CancelWorkflows cancels multiple workflows in a single database round-trip.
 // Workflows that are missing or already in a terminal state are silently skipped.
 func (c *client) CancelWorkflows(workflowIDs []string, opts ...CancelWorkflowOptions) error {
-	cwo := cancelWorkflowOptions{}
+	cwo := models.CancelWorkflowInput{}
 	for _, opt := range opts {
 		opt(&cwo)
 	}
@@ -885,7 +880,7 @@ func (c *client) CreateSchedule(input ClientScheduleInput) error {
 		return fmt.Errorf("failed to serialize context: %w", err)
 	}
 
-	return dbosCtx.systemDB.createSchedule(dbosCtx, createScheduleDBInput{
+	return dbosCtx.systemDB.CreateSchedule(dbosCtx, sysdb.CreateScheduleDBInput{
 		ScheduleID:        scheduleID,
 		ScheduleName:      input.ScheduleName,
 		WorkflowName:      input.WorkflowName,
@@ -933,7 +928,7 @@ func (c *client) ApplySchedules(schedules []ClientScheduleInput) error {
 		return errors.New("invalid DBOS context")
 	}
 
-	tx, err := dbosCtx.systemDB.(*sysDB).pool.BeginTx(dbosCtx, TxOptions{})
+	tx, err := dbosCtx.systemDB.Pool().BeginTx(dbosCtx, TxOptions{})
 	if err != nil {
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
@@ -947,10 +942,10 @@ func (c *client) ApplySchedules(schedules []ClientScheduleInput) error {
 
 		queueName := req.QueueName
 		if queueName == "" {
-			queueName = _DBOS_INTERNAL_QUEUE_NAME
+			queueName = models.InternalQueueName
 		}
 
-		if err := dbosCtx.systemDB.upsertSchedule(dbosCtx, upsertScheduleDBInput{
+		if err := dbosCtx.systemDB.UpsertSchedule(dbosCtx, sysdb.UpsertScheduleDBInput{
 			ScheduleID:        uuid.New().String(),
 			ScheduleName:      req.ScheduleName,
 			WorkflowName:      req.WorkflowName,
@@ -961,7 +956,7 @@ func (c *client) ApplySchedules(schedules []ClientScheduleInput) error {
 			AutomaticBackfill: req.AutomaticBackfill,
 			CronTimezone:      req.CronTimezone,
 			QueueName:         queueName,
-			tx:                tx,
+			Tx:                tx,
 		}); err != nil {
 			return fmt.Errorf("failed to upsert schedule: %w", err)
 		}
@@ -1057,6 +1052,6 @@ func (c *client) Shutdown(timeout time.Duration) {
 		dbosCtx.ctxCancelFunc(errors.New("client shutdown initiated"))
 
 		dbosCtx.logger.Debug("Shutting down system database")
-		dbosCtx.systemDB.shutdown(dbosCtx, timeout)
+		dbosCtx.systemDB.Shutdown(dbosCtx, timeout)
 	}
 }

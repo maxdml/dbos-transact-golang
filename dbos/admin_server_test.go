@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dbos-inc/dbos-transact-golang/dbos/internal/models"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
@@ -150,7 +152,7 @@ func TestAdminServer(t *testing.T) {
 					// Verify internal queue fields
 					foundInternalQueue := false
 					for _, queue := range queueMetadata {
-						if queue.Name == _DBOS_INTERNAL_QUEUE_NAME { // Internal queue name
+						if queue.Name == models.InternalQueueName { // Internal queue name
 							foundInternalQueue = true
 							assert.Nil(t, queue.GlobalConcurrency, "Expected internal queue to have no concurrency limit")
 							assert.Nil(t, queue.WorkerConcurrency, "Expected internal queue to have no worker concurrency limit")
@@ -1156,11 +1158,11 @@ func TestListWorkflowsRequestStatusDecoding(t *testing.T) {
 
 			// Apply the produced options and assert the resulting status filter.
 			opts := req.toListWorkflowsOptions()
-			var params listWorkflowsOptions
+			var params models.ListWorkflowsInput
 			for _, opt := range opts {
 				opt(&params)
 			}
-			assert.Equal(t, tt.expected, params.status, "Unexpected status filter")
+			assert.Equal(t, tt.expected, params.Status, "Unexpected status filter")
 		})
 	}
 }

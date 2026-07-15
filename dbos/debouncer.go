@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/dbos-inc/dbos-transact-golang/dbos/internal/models"
 	"github.com/google/uuid"
 )
 
@@ -130,7 +131,7 @@ func NewDebouncer[P any, R any](
 	// Enforce that debouncers can only be created before DBOS has launched
 	// because they need to register the internal debouncer workflow
 	if dbosCtx.launched.Load() {
-		panic(newInitializationError("cannot create debouncer after DBOS has launched"))
+		panic(models.NewInitializationError("cannot create debouncer after DBOS has launched"))
 	}
 
 	// Get the fully qualified name of the workflow function using reflection.
@@ -145,7 +146,7 @@ func NewDebouncer[P any, R any](
 	// Validate that the workflow is registered in the registry
 	// Assertively panic if the workflow is not registered, as a sign of highly unexpected behavior
 	if _, exists := dbosCtx.workflowRegistry.Load(fqn); !exists {
-		panic(newNonExistentWorkflowError(fqn))
+		panic(models.NewNonExistentWorkflowError(fqn))
 	}
 
 	// Register the internal debouncer workflow for this debouncer if it has not been registered yet (first debouncer for this workflow)
@@ -211,7 +212,7 @@ func (d *Debouncer[P, R]) Debounce(ctx DBOSContext, key string, delay time.Durat
 	for {
 		// internalDebouncerWF[P, R] is a generic workflow, so its dynamic name resolution will yield a different name than its registration name
 		// This is because the function passed through as an argument can have a different reflection name
-		_, err := RunWorkflow(ctx, internalDebouncerWF[P, R], dInput, WithQueue(_DBOS_INTERNAL_QUEUE_NAME), WithDeduplicationID(key), withWorkflowName(d.internalDebouncerFQN))
+		_, err := RunWorkflow(ctx, internalDebouncerWF[P, R], dInput, WithQueue(models.InternalQueueName), WithDeduplicationID(key), withWorkflowName(d.internalDebouncerFQN))
 		if err == nil {
 			return newWorkflowPollingHandle[R](ctx, dInput.TargetWorkflowID), nil
 		}
@@ -347,7 +348,7 @@ func (dc *DebouncerClient[P, R]) Debounce(key string, delay time.Duration, input
 	for {
 		// Try to enqueue the internal debouncer workflow
 		// Use the package-level Enqueue function which handles encoding automatically
-		_, err := Enqueue[debouncerInput[P], R](dc.Client, _DBOS_INTERNAL_QUEUE_NAME, dc.internalDebouncerFQN, dInput, WithEnqueueDeduplicationID(key))
+		_, err := Enqueue[debouncerInput[P], R](dc.Client, models.InternalQueueName, dc.internalDebouncerFQN, dInput, WithEnqueueDeduplicationID(key))
 		if err == nil {
 			return newWorkflowPollingHandle[R](dc.Client.(*client).dbosCtx, dInput.TargetWorkflowID), nil
 		}

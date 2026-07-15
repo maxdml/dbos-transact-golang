@@ -113,8 +113,6 @@ type SystemDatabase interface {
 
 	// Schedules
 	CreateSchedule(ctx context.Context, input CreateScheduleDBInput) error
-	// UpsertSchedule inserts a schedule or updates definition fields on conflict
-	// by schedule_name. schedule_id, status, and last_fired_at are preserved.
 	UpsertSchedule(ctx context.Context, input UpsertScheduleDBInput) error
 	ListSchedules(ctx context.Context, input ListSchedulesDBInput) ([]models.WorkflowSchedule, error)
 	UpdateSchedule(ctx context.Context, input UpdateScheduleDBInput) error
@@ -4910,9 +4908,6 @@ func (s *SysDB) getMetricStepCount(ctx context.Context, startEpochMs, endEpochMs
 /******* SCHEDULES ********/
 /*******************************/
 
-// UpsertScheduleDBInput carries fields for UpsertSchedule. On conflict by
-// schedule_name, definition fields are updated while schedule_id, status, and
-// last_fired_at are preserved.
 type UpsertScheduleDBInput struct {
 	ScheduleID        string
 	ScheduleName      string
@@ -5145,7 +5140,6 @@ func (s *SysDB) ListSchedules(ctx context.Context, input ListSchedulesDBInput) (
 				}
 			}
 		}
-		schedule.ContextJSON = contextJSON
 		if err := json.Unmarshal([]byte(contextJSON), &schedule.Context); err != nil {
 			schedule.Context = contextJSON
 		}

@@ -431,7 +431,7 @@ func TestApplySchedulesLiveUpdate(t *testing.T) {
 	dbosCtx := setupDBOS(t, setupDBOSOptions{dropDB: true, checkLeaks: true, schedulerPollingInterval: 100 * time.Millisecond})
 	defer dbosCtx.Shutdown(10 * time.Second)
 
-	resetLiveUpdateContexts()
+	resetLiveUpdateVersionCounts()
 	RegisterWorkflow(dbosCtx, testLiveUpdateScheduledWorkflow)
 	require.NoError(t, dbosCtx.Launch())
 
@@ -451,10 +451,8 @@ func TestApplySchedulesLiveUpdate(t *testing.T) {
 	require.NotNil(t, before)
 
 	require.Eventually(t, func() bool {
-		return liveUpdateContextHasVersion(1)
+		return liveUpdateVersionCount(1) >= 1
 	}, 10*time.Second, 100*time.Millisecond, "schedule should fire with context version 1")
-
-	countBefore := liveUpdateContextCount()
 
 	require.NoError(t, ApplySchedules(dbosCtx, []ApplySchedulesRequest{
 		{
@@ -471,8 +469,9 @@ func TestApplySchedulesLiveUpdate(t *testing.T) {
 	require.Equal(t, before.ScheduleID, after.ScheduleID, "live update must preserve schedule_id")
 
 	// Reconciler should restart the entry and fire with the new context.
+	// Version 2 fires can only come from the re-applied definition.
 	require.Eventually(t, func() bool {
-		return liveUpdateContextVersionCountSince(2, countBefore) >= 2
+		return liveUpdateVersionCount(2) >= 2
 	}, 10*time.Second, 100*time.Millisecond, "re-applied schedule should fire with context version 2")
 }
 
@@ -531,7 +530,6 @@ func TestCalculateScheduleSignature(t *testing.T) {
 		Schedule:          "* * * * *",
 		Status:            ScheduleStatusActive,
 		Context:           "ctx",
-		ContextJSON:       `"ctx"`,
 		LastFiredAt:       nil,
 		AutomaticBackfill: false,
 		CronTimezone:      "",
@@ -542,25 +540,33 @@ func TestCalculateScheduleSignature(t *testing.T) {
 	// Identity / lifecycle / runtime fields must NOT change the signature.
 	lastFired := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
 	unchanged := []WorkflowSchedule{
-		{ScheduleID: "id-2", ScheduleName: base.ScheduleName, WorkflowName: base.WorkflowName, Schedule: base.Schedule, Status: base.Status, ContextJSON: base.ContextJSON},
-		{ScheduleID: base.ScheduleID, ScheduleName: "other-name", WorkflowName: base.WorkflowName, Schedule: base.Schedule, Status: base.Status, ContextJSON: base.ContextJSON},
-		{ScheduleID: base.ScheduleID, ScheduleName: base.ScheduleName, WorkflowName: base.WorkflowName, Schedule: base.Schedule, Status: ScheduleStatusPaused, ContextJSON: base.ContextJSON},
-		{ScheduleID: base.ScheduleID, ScheduleName: base.ScheduleName, WorkflowName: base.WorkflowName, Schedule: base.Schedule, Status: base.Status, ContextJSON: base.ContextJSON, LastFiredAt: &lastFired},
-		{ScheduleID: base.ScheduleID, ScheduleName: base.ScheduleName, WorkflowName: base.WorkflowName, Schedule: base.Schedule, Status: base.Status, ContextJSON: base.ContextJSON, AutomaticBackfill: true},
+		{ScheduleID: "id-2", ScheduleName: base.ScheduleName, WorkflowName: base.WorkflowName, Schedule: base.Schedule, Status: base.Status, Context: base.Context},
+		{ScheduleID: base.ScheduleID, ScheduleName: "other-name", WorkflowName: base.WorkflowName, Schedule: base.Schedule, Status: base.Status, Context: base.Context},
+		{ScheduleID: base.ScheduleID, ScheduleName: base.ScheduleName, WorkflowName: base.WorkflowName, Schedule: base.Schedule, Status: ScheduleStatusPaused, Context: base.Context},
+		{ScheduleID: base.ScheduleID, ScheduleName: base.ScheduleName, WorkflowName: base.WorkflowName, Schedule: base.Schedule, Status: base.Status, Context: base.Context, LastFiredAt: &lastFired},
+		{ScheduleID: base.ScheduleID, ScheduleName: base.ScheduleName, WorkflowName: base.WorkflowName, Schedule: base.Schedule, Status: base.Status, Context: base.Context, AutomaticBackfill: true},
 	}
 	for i, s := range unchanged {
 		got := c.calculateSignature(s)
 		require.Equal(t, sig, got, "case %d should not change signature", i)
 	}
 
+	// Structurally equal map contexts must produce equal signatures
+	// (encoding/json marshals map keys in sorted order).
+	mapA := base
+	mapA.Context = map[string]any{"a": float64(1), "b": "x"}
+	mapB := base
+	mapB.Context = map[string]any{"b": "x", "a": float64(1)}
+	require.Equal(t, c.calculateSignature(mapA), c.calculateSignature(mapB))
+
 	// Definition fields MUST change the signature.
 	changed := []WorkflowSchedule{
-		{WorkflowName: "wf2", Schedule: base.Schedule, ContextJSON: base.ContextJSON},
-		{WorkflowName: base.WorkflowName, WorkflowClassName: "SomeClass", Schedule: base.Schedule, ContextJSON: base.ContextJSON},
-		{WorkflowName: base.WorkflowName, Schedule: "0 * * * *", ContextJSON: base.ContextJSON},
-		{WorkflowName: base.WorkflowName, Schedule: base.Schedule, ContextJSON: `"ctx2"`},
-		{WorkflowName: base.WorkflowName, Schedule: base.Schedule, ContextJSON: base.ContextJSON, CronTimezone: "America/Los_Angeles"},
-		{WorkflowName: base.WorkflowName, Schedule: base.Schedule, ContextJSON: base.ContextJSON, QueueName: "q"},
+		{WorkflowName: "wf2", Schedule: base.Schedule, Context: base.Context},
+		{WorkflowName: base.WorkflowName, WorkflowClassName: "SomeClass", Schedule: base.Schedule, Context: base.Context},
+		{WorkflowName: base.WorkflowName, Schedule: "0 * * * *", Context: base.Context},
+		{WorkflowName: base.WorkflowName, Schedule: base.Schedule, Context: "ctx2"},
+		{WorkflowName: base.WorkflowName, Schedule: base.Schedule, Context: base.Context, CronTimezone: "America/Los_Angeles"},
+		{WorkflowName: base.WorkflowName, Schedule: base.Schedule, Context: base.Context, QueueName: "q"},
 	}
 	for i, s := range changed {
 		got := c.calculateSignature(s)
@@ -874,71 +880,33 @@ func testWorkflowForScheduleCustomName(ctx DBOSContext, input ScheduledWorkflowI
 
 var scheduledInputCapture sync.Map
 
-// liveUpdateContextCapture holds contexts seen by testLiveUpdateScheduledWorkflow.
+// liveUpdateVersionCounts counts fires of testLiveUpdateScheduledWorkflow by the
+// "version" value in the schedule context.
 var (
-	liveUpdateContextsMu sync.Mutex
-	liveUpdateContexts   []any
+	liveUpdateMu            sync.Mutex
+	liveUpdateVersionCounts = map[float64]int{}
 )
 
-func resetLiveUpdateContexts() {
-	liveUpdateContextsMu.Lock()
-	liveUpdateContexts = nil
-	liveUpdateContextsMu.Unlock()
+func resetLiveUpdateVersionCounts() {
+	liveUpdateMu.Lock()
+	liveUpdateVersionCounts = map[float64]int{}
+	liveUpdateMu.Unlock()
 }
 
-func appendLiveUpdateContext(ctx any) {
-	liveUpdateContextsMu.Lock()
-	liveUpdateContexts = append(liveUpdateContexts, ctx)
-	liveUpdateContextsMu.Unlock()
-}
-
-func snapshotLiveUpdateContexts() []any {
-	liveUpdateContextsMu.Lock()
-	defer liveUpdateContextsMu.Unlock()
-	out := make([]any, len(liveUpdateContexts))
-	copy(out, liveUpdateContexts)
-	return out
-}
-
-func liveUpdateContextCount() int {
-	liveUpdateContextsMu.Lock()
-	defer liveUpdateContextsMu.Unlock()
-	return len(liveUpdateContexts)
-}
-
-func liveUpdateContextHasVersion(version float64) bool {
-	for _, c := range snapshotLiveUpdateContexts() {
-		m, ok := c.(map[string]any)
-		if !ok {
-			continue
-		}
-		if v, ok := m["version"].(float64); ok && v == version {
-			return true
-		}
-	}
-	return false
-}
-
-func liveUpdateContextVersionCountSince(version float64, since int) int {
-	xs := snapshotLiveUpdateContexts()
-	if since > len(xs) {
-		since = len(xs)
-	}
-	n := 0
-	for _, c := range xs[since:] {
-		m, ok := c.(map[string]any)
-		if !ok {
-			continue
-		}
-		if v, ok := m["version"].(float64); ok && v == version {
-			n++
-		}
-	}
-	return n
+func liveUpdateVersionCount(version float64) int {
+	liveUpdateMu.Lock()
+	defer liveUpdateMu.Unlock()
+	return liveUpdateVersionCounts[version]
 }
 
 func testLiveUpdateScheduledWorkflow(ctx DBOSContext, input ScheduledWorkflowInput) (any, error) {
-	appendLiveUpdateContext(input.Context)
+	if m, ok := input.Context.(map[string]any); ok {
+		if v, ok := m["version"].(float64); ok {
+			liveUpdateMu.Lock()
+			liveUpdateVersionCounts[v]++
+			liveUpdateMu.Unlock()
+		}
+	}
 	return "completed", nil
 }
 

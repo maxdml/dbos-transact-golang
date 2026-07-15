@@ -1,6 +1,7 @@
 package dbos
 
 import (
+	"encoding/json"
 	"fmt"
 	"math/rand/v2"
 	"sync/atomic"
@@ -266,9 +267,7 @@ func (c *dbosContext) runScheduleReconciler() {
 // scheduleSignature holds definition fields used to detect when an installed
 // cron entry must be restarted after ApplySchedules / reconciler updates.
 // Identity, lifecycle, and runtime fields (schedule_id, status, last_fired_at,
-// automatic_backfill) are intentionally omitted. All fields are comparable so
-// signatures can be checked with ==; ContextJSON is the raw DB column rather
-// than decoded Context (any), which is not comparable.
+// automatic_backfill) are intentionally omitted.
 type scheduleSignature struct {
 	WorkflowName      string
 	WorkflowClassName string
@@ -278,13 +277,19 @@ type scheduleSignature struct {
 	QueueName         string
 }
 
-// calculateSignature extracts definition fields for equality comparison.
 func (c *dbosContext) calculateSignature(s WorkflowSchedule) scheduleSignature {
+	ctxJSON, err := json.Marshal(s.Context)
+	if err != nil {
+		// Context is a JSON-decoded value, so this should be unreachable. Fall
+		// back to fmt, which prints maps with sorted keys, keeping the
+		// signature deterministic.
+		ctxJSON = fmt.Appendf(nil, "%+v", s.Context)
+	}
 	return scheduleSignature{
 		WorkflowName:      s.WorkflowName,
 		WorkflowClassName: s.WorkflowClassName,
 		Schedule:          s.Schedule,
-		ContextJSON:       s.ContextJSON,
+		ContextJSON:       string(ctxJSON),
 		CronTimezone:      s.CronTimezone,
 		QueueName:         s.QueueName,
 	}

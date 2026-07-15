@@ -21,15 +21,10 @@ type WorkflowSchedule struct {
 	Schedule          string         `json:"schedule"`
 	Status            ScheduleStatus `json:"status"`
 	Context           any            `json:"context"`
-	// ContextJSON is the raw JSON string of the context column from the system
-	// database. It is not included in JSON API responses. The schedule
-	// reconciler uses it for definition signature comparison so equality is
-	// byte-stable without re-marshaling decoded Context values.
-	ContextJSON       string     `json:"-"`
-	LastFiredAt       *time.Time `json:"last_fired_at,omitempty"`
-	AutomaticBackfill bool       `json:"automatic_backfill"`
-	CronTimezone      string     `json:"cron_timezone,omitempty"`
-	QueueName         string     `json:"queue_name,omitempty"`
+	LastFiredAt       *time.Time     `json:"last_fired_at,omitempty"`
+	AutomaticBackfill bool           `json:"automatic_backfill"`
+	CronTimezone      string         `json:"cron_timezone,omitempty"`
+	QueueName         string         `json:"queue_name,omitempty"`
 }
 
 // ScheduledWorkflowInput is the input type that DB-backed scheduled workflow
